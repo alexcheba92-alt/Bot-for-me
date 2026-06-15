@@ -13,7 +13,7 @@ const CHECK_INTERVAL = 300000; // 5 минут в миллисекундах
 const BASE_URL = 'https://www.inberlinwohnen.de';
 const APARTMENTS_URL = `${BASE_URL}/wohnungsfinder/`;
 
-// Теперь храним базу прямо в оперативной памяти процесса
+// Храним базу прямо в оперативной памяти процесса
 const memorySeenApartments = new Set();
 
 // Отправка уведомления в Telegram
@@ -46,7 +46,9 @@ async function checkApartments() {
     console.log(`[${new Date().toLocaleTimeString()}] Проверяю сайт... (уже известно ${memorySeenApartments.size} квартир)`);
     
     const browser = await chromium.launch({ headless: true });
+    // Эмулируем обычный большой браузер, чтобы сайт выдавал полную разметку
     const context = await browser.newContext({
+        viewport: { width: 1280, height: 800 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
     });
     const page = await context.newPage();
@@ -87,28 +89,42 @@ async function checkApartments() {
 
         // 3. Переход к поиску квартир
         await page.goto(APARTMENTS_URL, { waitUntil: 'networkidle', timeout: 30000 });
-        await page.waitForSelector('.tb-wfinder__results-item, article, [class*="item"]', { timeout: 10000 }).catch(() => {});
+        
+        // Ждем загрузки основного контейнера результатов (он точно есть на странице)
+        await page.waitForSelector('.tb-wfinder__results, #wfinder-list', { timeout: 15000 }).catch(() => {});
+        // Небольшая пауза, чтобы скрипты сайта успели отрендерить карточки
+        await page.waitForTimeout(3000);
 
-        // 4. Сбор элементов квартир
-        const apartmentLinks = await page.$$eval('a[href*="/expose/"], a[href*="/wohnung/"]', links => {
+        // 4. Сбор ссылок на квартиры (ищем абсолютно все ссылки на expose на странице)
+        const apartmentLinks = await page.$$eval('a[href*="/expose/"]', links => {
             return links.map(link => ({
                 href: link.href,
-                title: link.innerText.trim() || "Спецификации внутри ссылки"
+                title: link.innerText.trim() || "Ссылка"
             }));
         });
 
         let newCount = 0;
         const isFirstRun = (memorySeenApartments.size === 0);
 
+        // Фильтруем дубликаты ссылок, которые получили со страницы
+        const uniqueLinks = [];
+        const seenHrefs = new Set();
         for (const apt of apartmentLinks) {
-            const match = apt.href.match(/\/([0-9]+)\/?$/);
+            if (!seenHrefs.has(apt.href)) {
+                seenHrefs.add(apt.href);
+                uniqueLinks.push(apt);
+            }
+        }
+
+        for (const apt of uniqueLinks) {
+            // Извлекаем ID квартиры из ссылки (например, /expose/1234/)
+            const match = apt.href.match(/\/expose\/([0-9]+)/);
             const aptId = match ? match[1] : apt.href;
 
             if (aptId && !memorySeenApartments.has(aptId)) {
                 memorySeenApartments.add(aptId);
                 
-                // Если это самый первый запуск бота, мы просто запоминаем квартиры, 
-                // но не шлем спам в ТГ. В ТГ пойдут только реально НОВЫЕ квартиры, которые появятся позже.
+                // Если это самый первый запуск бота, мы просто сохраняем текущие 17 квартир, чтобы не спамить.
                 if (!isFirstRun) {
                     newCount++;
                     const timestamp = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
@@ -137,7 +153,7 @@ async function checkApartments() {
 // Главный цикл
 async function main() {
     console.log("🤖 Бот на Node.js запущен!");
-    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nВключена умная память в оперативной системе.");
+    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nСелекторы поиска квартир перенастроены.");
     
     await checkApartments();
     
