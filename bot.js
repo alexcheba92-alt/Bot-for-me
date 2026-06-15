@@ -68,25 +68,51 @@ async function checkApartments() {
     const page = await context.newPage();
 
     try {
-        // 1. Авторизация
+        // 1. Открываем страницу авторизации
         await page.goto(`${BASE_URL}/login/`, { waitUntil: 'networkidle', timeout: 30000 });
         
-        // Заполняем форму, если она есть
+        // --- ОБХОД БАННЕРА КУКИ (НОВОЕ!) ---
+        // Ищем немецкие кнопки согласия (Auswahl erlauben, Акцептировать, Принять всё)
+        const cookieButtons = [
+            'button:has-text("Auswahl erlauben")',
+            'button:has-text("Alle akzeptieren")',
+            'button:has-text("Akzeptieren")',
+            '#uc-btn-accept-banner',
+            '.cm-btn-success'
+        ];
+        
+        for (const selector of cookieButtons) {
+            try {
+                if (await page.isVisible(selector)) {
+                    await page.click(selector);
+                    console.log("Всплывающий баннер куки успешно закрыт.");
+                    await page.waitForTimeout(1000); // секундная пауза, чтобы баннер исчез
+                    break;
+                }
+            } catch (e) {
+                // Пропускаем ошибку, если конкретный селектор не подошел
+            }
+        }
+        // ------------------------------------
+
+        // 2. Заполняем форму авторизации
         if (await page.isVisible('input[name="email"]')) {
             await page.fill('input[name="email"]', INBERLIN_EMAIL);
             await page.fill('input[name="password"]', INBERLIN_PASSWORD);
-            await page.click('button[type="submit"], input[type="submit"]');
+            
+            // Кликаем на кнопку входа
+            await page.click('button[type="submit"], input[type="submit"], .btn-login');
             await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
             console.log("Выполнен вход в аккаунт");
         }
 
-        // 2. Переход к поиску квартир
+        // 3. Переход к поиску квартир
         await page.goto(APARTMENTS_URL, { waitUntil: 'networkidle', timeout: 30000 });
         
-        // Ждем подгрузки элементов списка (карта и карточки)
+        // Ждем подгрузки элементов списка
         await page.waitForSelector('.tb-wfinder__results-item, article, [class*="item"]', { timeout: 10000 }).catch(() => {});
 
-        // 3. Сбор элементов квартир
+        // 4. Сбор элементов квартир по ссылкам на экспонаты
         const apartmentLinks = await page.$$eval('a[href*="/expose/"], a[href*="/wohnung/"]', links => {
             return links.map(link => ({
                 href: link.href,
@@ -129,7 +155,7 @@ async function checkApartments() {
 // Главный цикл
 async function main() {
     console.log("🤖 Бот на Node.js запущен!");
-    await sendTelegram("🤖 <b>Бот успешно перезапущен на JS!</b>\nИспользую браузерный движок для точного поиска квартир.");
+    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nДобавлена защита от блокировки всплывающими окнами.");
     
     await checkApartments();
     
