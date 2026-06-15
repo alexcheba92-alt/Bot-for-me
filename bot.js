@@ -11,7 +11,9 @@ const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD || "ваш_пароль"
 const CHECK_INTERVAL = 300000; // 5 минут в миллисекундах
 
 const BASE_URL = 'https://www.inberlinwohnen.de';
-const APARTMENTS_URL = `${BASE_URL}/mein-bereich/wohnungsfinder/`;
+
+// Вставили твою точную ссылку с зашифрованными фильтрами
+const APARTMENTS_URL = "https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder?q=eyJpdiI6IkZWejd0ZFlVSEljbWU1Z0hXT0tmMmc9PSIsInZhbHVlIjoia2lIczRQQUt4VWVYOXJ2U0Y5TTlDc2JadDZzTEtRRk1RK3E0QlFkc29ub3NFSk5McWtncHBoOVVRT0txTDNleVVZalMyZ0RFc3dQdHRwQ2kzaVhqdnczTVV3ZWtmT1FoZDRkU09tL0E4QVhTY1ExUEtGZFlkaDFEVkR5RitzVTRpWHBsUmlFMS80SUNsQ25iaEVjR25zNUZNRmVEUkE4aSszNE1kd3hIdVIwSlFuc0ZxaUxFclJPZDVoMTdWR3RpRVp4cmRoZFd1bGxYaUhXVjUxYXV6Rm41amRrazBJRmlEYUpPNmEwZVFsSWFBRkR0b3dpL1MxL2VRWm5MbHczVDNHV25xemV0R3lTalo4SVpoUzJrRk1CTG5vdUdjTldIemFDYkF2OC9NdTU2OFJLbEIvY3NuY2pRbHo2Y01aOW1hQUNGT1NhSy8xV3dEaHdoV3dVeXJVaHBldnRlU0lpRkVuek5SWlpyTHVKMmF6WlA0YXdaUXcvSkFQSldtcWh4ZnJYUWljRDVmdC82a2s4d1htNFpxNkVEWFAwbGNBdjNBSnRENkFFV2k0aXQxbm1YNjZwc1VhREFPb2pLUUpZVCIsIm1hYyI6IjhhZTViZjViMDM2YWNiYWY1YzEwNGIwODQzN2Y0NzZjMGYxNzgxZGRmNTI5OTNiNjg0ZWQ3NDM5NjU2ZTA3MDEiLCJ0YWciOiIifQ%3D%3D"; 
 
 // Храним базу прямо в оперативной памяти процесса
 const memorySeenApartments = new Set();
@@ -79,62 +81,18 @@ async function checkApartments() {
                 page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => {})
             ]);
 
-            console.log("Успешно авторизовались. Переходим к поиску...");
+            console.log("Успешно авторизовались.");
             await page.waitForTimeout(2000);
         }
 
-        // ШАГ 3: Переходим в Wohnungsfinder
+        // ШАГ 3: Переходим СРАЗУ на страницу с зашифрованными фильтрами
+        console.log("Загружаю страницу поиска с фильтрами...");
         await page.goto(APARTMENTS_URL, { waitUntil: 'networkidle', timeout: 40000 });
-        await page.waitForTimeout(3000);
-
-        // ШАГ 4: ОТКРЫВАЕМ И ВЫСТАВЛЯЕМ ФИЛЬТРЫ (Как на твоем скриншоте)
-        console.log("Настраиваю фильтры поиска...");
         
-        // Кликаем по кнопке с лупой, чтобы развернуть панель фильтров (если она скрыта)
-        const filterButton = await page.$('.tb-wfinder__toggle-filter, button.criteria-toggle, .wfinder-filter-toggle');
-        if (filterButton) {
-            await filterButton.click();
-            await page.waitForTimeout(1000);
-        }
-
-        // Заполняем максимальную стоимость: 600.00
-        // Ищем поле по имени переменной стоимости (обычно q[miete_max] или похожее) или по id/placeholder
-        const mieteInput = await page.$('input[name*="miete_max"], input[id*="miete_max"], #nettokaltmiete_max');
-        if (mieteInput) {
-            await mieteInput.click({ clickCount: 3 }); // Выделяем старое значение
-            await mieteInput.type('600.00');
-        }
-
-        // Выставляем количество комнат: от 3 до 3
-        const zimmerMin = await page.$('select[name*="zimmer_min"], input[name*="zimmer_min"], #zimmer_min');
-        const zimmerMax = await page.$('select[name*="zimmer_max"], input[name*="zimmer_max"], #zimmer_max');
-        
-        if (zimmerMin && zimmerMax) {
-            // Если это выпадающий список (select)
-            if ((await zimmerMin.tagName()) === 'SELECT') {
-                await zimmerMin.selectOption('3');
-                await zimmerMax.selectOption('3');
-            } else {
-                // Если это обычное текстовое поле ввода
-                await zimmerMin.click({ clickCount: 3 }); await zimmerMin.type('3');
-                await zimmerMax.click({ clickCount: 3 }); await zimmerMax.type('3');
-            }
-        }
-
-        // Нажимаем кнопку «Wohnung suchen» (Применить фильтр)
-        console.log("Применяю фильтры...");
-        const searchSubmit = await page.$('button:has-text("Wohnung suchen"), input[value="Wohnung suchen"], .tb-wfinder__submit');
-        if (searchSubmit) {
-            await searchSubmit.click();
-        } else {
-            // Если кнопку не нашли по тексту, жмем Enter в поле цены
-            if (mieteInput) await mieteInput.press('Enter');
-        }
-
-        // Ожидаем обновления результатов
+        // Даем сайту 5 секунд спокойно дорендерить карточки
         await page.waitForTimeout(5000);
 
-        // ШАГ 5: Сбор всех отфильтрованных квартир
+        // ШАГ 4: Сбор всех найденных квартир
         const apartmentLinks = await page.$$eval('a[href*="/expose/"]', links => {
             return links.map(link => ({ href: link.href }));
         });
@@ -161,7 +119,7 @@ async function checkApartments() {
         }
 
         if (isFirstRun) {
-            console.log(`[Первый запуск] Скрипт применил фильтры. Сохранено в память: ${memorySeenApartments.size} квартир.`);
+            console.log(`[Первый запуск] Скрипт успешно проверил страницу. Сохранено в память: ${memorySeenApartments.size} квартир.`);
         } else if (newCount > 0) {
             console.log(`🏠 Найдено ${newCount} новых квартир!`);
         } else {
@@ -178,7 +136,7 @@ async function checkApartments() {
 // Главный цикл
 async function main() {
     console.log("🤖 Бот запущен!");
-    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nВнедрен блок автоматического заполнения фильтров поиска (600€ / 3 комнаты).");
+    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nПоиск переведен на шифрованный URL с вашими фильтрами.");
     
     await checkApartments();
     
