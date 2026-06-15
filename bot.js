@@ -9,23 +9,18 @@ const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD;
 const CHECK_INTERVAL = 300000;
 
 const SEEN_FILE = '/tmp/seen.json';
-
 let seen = new Set();
 
-// Загрузка seen из файла
 function loadSeen() {
     try {
         if (fs.existsSync(SEEN_FILE)) {
             const data = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
             seen = new Set(data);
-            console.log(`✅ Загружено ${seen.size} квартир из памяти`);
+            console.log(`✅ Загружено из памяти: ${seen.size} квартир`);
         }
-    } catch (e) {
-        console.log('Seen файл пуст или повреждён, начинаем с чистого');
-    }
+    } catch (e) {}
 }
 
-// Сохранение seen
 function saveSeen() {
     try {
         fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen]));
@@ -39,9 +34,9 @@ async function sendTelegram(text, url = null) {
     }
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload);
-        console.log('✅ Telegram отправлено');
+        console.log('✅ Telegram OK');
     } catch (e) {
-        console.error('❌ Telegram ошибка:', e.message);
+        console.error('Telegram error:', e.message);
     }
 }
 
@@ -50,41 +45,49 @@ async function checkApartments() {
     console.log(`[${now}] Запуск проверки...`);
 
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-    const page = await browser.newContext({
-        ...devices['iPhone 13 Pro'],
-        locale: 'de-DE',
-        timezoneId: 'Europe/Berlin',
-    }).then(ctx => ctx.newPage());
+    const page = await browser.newContext({ ...devices['iPhone 13 Pro'], locale: 'de-DE' }).then(c => c.newPage());
 
     try {
-        // ... (твоя авторизация и фильтры остаются почти без изменений) ...
+        // Авторизация и переход (оставил почти как было)
+        await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
+        
+        if (await page.isVisible('input[name="email"]')) {
+            await page.fill('input[name="email"]', INBERLIN_EMAIL);
+            await page.fill('input[name="password"]', INBERLIN_PASSWORD);
+            await page.click('button[type="submit"]');
+            await page.waitForTimeout(4000);
+        }
+
         await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForTimeout(4000);
+        await page.waitForTimeout(5000);
 
-        // Фильтры (оставил как у тебя)
-        const mieteSelectors = ['input[name*="miete_bis"], input[placeholder*="Kaltmiete"]'];
-        for (const sel of mieteSelectors) {
-            const el = page.locator(sel).last();
-            if (await el.isVisible({ timeout: 3000 })) await el.fill('600');
-        }
-
-        const zimmerSelectors = ['input[name*="zimmer"]'];
-        for (const sel of zimmerSelectors) {
-            const el = page.locator(sel).first();
-            if (await el.isVisible({ timeout: 3000 })) await el.fill('3');
-        }
-
+        // Фильтры
+        console.log('Применяю фильтры...');
+        await page.locator('input[name*="miete_bis"], input[placeholder*="Kaltmiete"]').last().fill('600').catch(() => {});
+        await page.locator('input[name*="zimmer"]').first().fill('3').catch(() => {});
         await page.locator('button:has-text("Wohnung suchen"), button[type="submit"]').click().catch(() => {});
         await page.waitForTimeout(10000);
 
+        // === УЛУЧШЕННЫЙ ПАРСИНГ ===
         const apartments = await page.evaluate(() => {
             const results = [];
             document.querySelectorAll('a').forEach(a => {
                 const href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ');
-                if (href && (href.includes('/expose/') || href.includes('howoge') || href.includes('gewobag') || 
-                             href.includes('degewo') || href.includes('detail'))) {
-                    results.push({ href, text: text.substring(0, 120) || 'Квартира' });
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
+                
+                // Фильтруем только реальные ссылки на квартиры
+                if (!href || href.length < 30) return;
+                if (href.includes('/unternehmen/') || href.includes('ueber-uns') || href.includes('/impressum')) return;
+                
+                if (href.includes('/expose/') || 
+                    href.includes('/wohnung/') || 
+                    href.includes('/immobilien/') || 
+                    (href.includes('howoge') && href.includes('/')) || 
+                    (href.includes('gewobag') && href.includes('/')) ||
+                    (href.includes('degewo') && href.includes('/'))) {
+                    
+                    results.push({ href, text, site: new URL(href).hostname });
                 }
             });
             return results;
@@ -92,37 +95,42 @@ async function checkApartments() {
 
         console.log(`Найдено потенциальных ссылок: ${apartments.length}`);
 
-        const isFirstRunEver = seen.size === 0 && apartments.length > 0;
         let newCount = 0;
+        const isFirstEver = seen.size === 0;
 
         for (const apt of apartments) {
-            const match = apt.href.match(/expose\/([^/?#]+)/) || apt.href.match(/(\d{5,}-?\d*)/);
-            const id = match ? match[1] : apt.href;
+            const id = apt.href; // используем полную ссылку как ID
 
             if (!seen.has(id)) {
                 seen.add(id);
                 newCount++;
+
+                const siteName = apt.site.replace('www.', '').split('.')[0].toUpperCase();
                 const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
+
                 await sendTelegram(
-                    `🏠 <b>Новая 3-комнатная до 600€ Kaltmiete!</b>\n⏰ ${time}\n📝 ${apt.text}...`,
+                    `🏠 <b>Новая 3-комнатная до 600€ Kaltmiete!</b>\n\n` +
+                    `🕒 ${time}\n` +
+                    `📍 ${siteName}\n` +
+                    `📝 ${apt.text}...`,
                     apt.href
                 );
-                await new Promise(r => setTimeout(r, 1500));
+                await new Promise(r => setTimeout(r, 1800));
             }
         }
 
-        if (isFirstRunEver) {
-            await sendTelegram(`🤖 Бот успешно запущен!\nФильтры: 3 Zimmer ≤ 600€ Kaltmiete\nСейчас в базе: ${seen.size} квартир`);
-        } else if (newCount > 0) {
-            console.log(`Отправлено ${newCount} новых квартир`);
-        } else {
+        if (isFirstEver) {
+            await sendTelegram(`🤖 <b>Бот успешно запущен!</b>\nМониторим 3-комнатные ≤ 600€ Kaltmiete\nСейчас в базе: ${seen.size}`);
+        } else if (newCount === 0) {
             console.log('Новых квартир нет');
+        } else {
+            console.log(`Отправлено ${newCount} новых квартир`);
         }
 
         saveSeen();
 
     } catch (e) {
-        console.error('❌ Ошибка:', e.message);
+        console.error('Ошибка:', e.message);
         await sendTelegram(`⚠️ Ошибка бота: ${e.message}`);
     } finally {
         await browser.close();
