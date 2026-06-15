@@ -35,7 +35,6 @@ async function sendTelegram(text, url = null) {
 
     try {
         await axios.post(apiUrl, payload, { timeout: 10000 });
-        console.log(`[${new Date().toLocaleTimeString()}] Telegram уведомление отправлено`);
     } catch (error) {
         console.error("Ошибка отправки в Telegram:", error.message);
     }
@@ -43,7 +42,7 @@ async function sendTelegram(text, url = null) {
 
 // Основная функция парсинга
 async function checkApartments() {
-    console.log(`[${new Date().toLocaleTimeString()}] Проверяю сайт... (уже известно ${memorySeenApartments.size} квартир)`);
+    console.log(`[${new Date().toLocaleTimeString()}] Запуск новой сессии проверки...`);
     
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
@@ -75,25 +74,67 @@ async function checkApartments() {
             
             console.log("Данные введены, нажимаю кнопку войти...");
             
-            // Нажимаем кнопку и ждем, пока страница полностью перезагрузится (вернет на главную)
             await Promise.all([
                 page.click('button[type="submit"], input[type="submit"]'),
                 page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }).catch(() => {})
             ]);
 
-            console.log("Форма отправлена. Перезагрузка завершена.");
-            await page.waitForTimeout(2000); // Небольшая пауза для надежности сессии
+            console.log("Успешно авторизовались. Переходим к поиску...");
+            await page.waitForTimeout(2000);
         }
 
-        // ШАГ 3: Теперь принудительно переходим по прямой ссылке в личный Wohnungsfinder
-        console.log(`Перехожу по прямой ссылке: ${APARTMENTS_URL}`);
+        // ШАГ 3: Переходим в Wohnungsfinder
         await page.goto(APARTMENTS_URL, { waitUntil: 'networkidle', timeout: 40000 });
-        
-        // Ждем подгрузки результатов и даем 4 секунды скриптам отфильтровать квартиры
-        await page.waitForSelector('.tb-wfinder__results, #wfinder-list, a[href*="/expose/"]', { timeout: 20000 }).catch(() => {});
-        await page.waitForTimeout(4000);
+        await page.waitForTimeout(3000);
 
-        // ШАГ 4: Сбор всех найденных квартир
+        // ШАГ 4: ОТКРЫВАЕМ И ВЫСТАВЛЯЕМ ФИЛЬТРЫ (Как на твоем скриншоте)
+        console.log("Настраиваю фильтры поиска...");
+        
+        // Кликаем по кнопке с лупой, чтобы развернуть панель фильтров (если она скрыта)
+        const filterButton = await page.$('.tb-wfinder__toggle-filter, button.criteria-toggle, .wfinder-filter-toggle');
+        if (filterButton) {
+            await filterButton.click();
+            await page.waitForTimeout(1000);
+        }
+
+        // Заполняем максимальную стоимость: 600.00
+        // Ищем поле по имени переменной стоимости (обычно q[miete_max] или похожее) или по id/placeholder
+        const mieteInput = await page.$('input[name*="miete_max"], input[id*="miete_max"], #nettokaltmiete_max');
+        if (mieteInput) {
+            await mieteInput.click({ clickCount: 3 }); // Выделяем старое значение
+            await mieteInput.type('600.00');
+        }
+
+        // Выставляем количество комнат: от 3 до 3
+        const zimmerMin = await page.$('select[name*="zimmer_min"], input[name*="zimmer_min"], #zimmer_min');
+        const zimmerMax = await page.$('select[name*="zimmer_max"], input[name*="zimmer_max"], #zimmer_max');
+        
+        if (zimmerMin && zimmerMax) {
+            // Если это выпадающий список (select)
+            if ((await zimmerMin.tagName()) === 'SELECT') {
+                await zimmerMin.selectOption('3');
+                await zimmerMax.selectOption('3');
+            } else {
+                // Если это обычное текстовое поле ввода
+                await zimmerMin.click({ clickCount: 3 }); await zimmerMin.type('3');
+                await zimmerMax.click({ clickCount: 3 }); await zimmerMax.type('3');
+            }
+        }
+
+        // Нажимаем кнопку «Wohnung suchen» (Применить фильтр)
+        console.log("Применяю фильтры...");
+        const searchSubmit = await page.$('button:has-text("Wohnung suchen"), input[value="Wohnung suchen"], .tb-wfinder__submit');
+        if (searchSubmit) {
+            await searchSubmit.click();
+        } else {
+            // Если кнопку не нашли по тексту, жмем Enter в поле цены
+            if (mieteInput) await mieteInput.press('Enter');
+        }
+
+        // Ожидаем обновления результатов
+        await page.waitForTimeout(5000);
+
+        // ШАГ 5: Сбор всех отфильтрованных квартир
         const apartmentLinks = await page.$$eval('a[href*="/expose/"]', links => {
             return links.map(link => ({ href: link.href }));
         });
@@ -120,11 +161,11 @@ async function checkApartments() {
         }
 
         if (isFirstRun) {
-            console.log(`[Первый запуск] Успешно залогинились и запомнили ${memorySeenApartments.size} квартир.`);
+            console.log(`[Первый запуск] Скрипт применил фильтры. Сохранено в память: ${memorySeenApartments.size} квартир.`);
         } else if (newCount > 0) {
             console.log(`🏠 Найдено ${newCount} новых квартир!`);
         } else {
-            console.log("Новых квартир нет.");
+            console.log("Новых вариантов по фильтрам не обнаружено.");
         }
 
     } catch (error) {
@@ -137,7 +178,7 @@ async function checkApartments() {
 // Главный цикл
 async function main() {
     console.log("🤖 Бот запущен!");
-    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nНастроена правильная цепочка переходов: Вход -> Главная -> Личный поиск.");
+    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nВнедрен блок автоматического заполнения фильтров поиска (600€ / 3 комнаты).");
     
     await checkApartments();
     
