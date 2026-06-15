@@ -16,19 +16,25 @@ const SEEN_FILE = path.join(__dirname, 'seen_apartments.json');
 const BASE_URL = 'https://www.inberlinwohnen.de';
 const APARTMENTS_URL = `${BASE_URL}/wohnungsfinder/`;
 
-// Загрузка базы известных квартир
+// Загрузка базы известных квартир с жесткой проверкой на Set
 let seenApartments = new Set();
 if (fs.existsSync(SEEN_FILE)) {
     try {
         const data = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
-        seenApartments = new Set(data);
+        // Гарантируем, что данные превратятся в Set, даже если там массив
+        seenApartments = new Set(Array.isArray(data) ? data : []);
     } catch (e) {
         console.error("Ошибка чтения файла seen_apartments.json:", e);
+        seenApartments = new Set();
     }
 }
 
 function saveSeen() {
-    fs.writeFileSync(SEEN_FILE, JSON.stringify(Array.from(seenApartments)), 'utf8');
+    try {
+        fs.writeFileSync(SEEN_FILE, JSON.stringify(Array.from(seenApartments)), 'utf8');
+    } catch (e) {
+        console.error("Ошибка записи файла:", e);
+    }
 }
 
 // Отправка уведомления в Telegram
@@ -60,7 +66,6 @@ async function sendTelegram(text, url = null) {
 async function checkApartments() {
     console.log(`[${new Date().toLocaleTimeString()}] Проверяю сайт... (уже известно ${seenApartments.size} квартир)`);
     
-    // Запуск headless-браузера
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
@@ -71,8 +76,7 @@ async function checkApartments() {
         // 1. Открываем страницу авторизации
         await page.goto(`${BASE_URL}/login/`, { waitUntil: 'networkidle', timeout: 30000 });
         
-        // --- ОБХОД БАННЕРА КУКИ (НОВОЕ!) ---
-        // Ищем немецкие кнопки согласия (Auswahl erlauben, Акцептировать, Принять всё)
+        // Обход баннера куки
         const cookieButtons = [
             'button:has-text("Auswahl erlauben")',
             'button:has-text("Alle akzeptieren")',
@@ -86,21 +90,17 @@ async function checkApartments() {
                 if (await page.isVisible(selector)) {
                     await page.click(selector);
                     console.log("Всплывающий баннер куки успешно закрыт.");
-                    await page.waitForTimeout(1000); // секундная пауза, чтобы баннер исчез
+                    await page.waitForTimeout(1000);
                     break;
                 }
-            } catch (e) {
-                // Пропускаем ошибку, если конкретный селектор не подошел
-            }
+            } catch (e) {}
         }
-        // ------------------------------------
 
         // 2. Заполняем форму авторизации
         if (await page.isVisible('input[name="email"]')) {
             await page.fill('input[name="email"]', INBERLIN_EMAIL);
             await page.fill('input[name="password"]', INBERLIN_PASSWORD);
             
-            // Кликаем на кнопку входа
             await page.click('button[type="submit"], input[type="submit"], .btn-login');
             await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
             console.log("Выполнен вход в аккаунт");
@@ -112,7 +112,7 @@ async function checkApartments() {
         // Ждем подгрузки элементов списка
         await page.waitForSelector('.tb-wfinder__results-item, article, [class*="item"]', { timeout: 10000 }).catch(() => {});
 
-        // 4. Сбор элементов квартир по ссылкам на экспонаты
+        // 4. Сбор элементов квартир
         const apartmentLinks = await page.$$eval('a[href*="/expose/"], a[href*="/wohnung/"]', links => {
             return links.map(link => ({
                 href: link.href,
@@ -121,6 +121,11 @@ async function checkApartments() {
         });
 
         let newCount = 0;
+
+        // На всякий случай проверяем, что seenApartments это Set перед циклом
+        if (!(seenApartments instanceof Set)) {
+            seenApartments = new Set(seenApartments);
+        }
 
         for (const apt of apartmentLinks) {
             const match = apt.href.match(/\/([0-9]+)\/?$/);
@@ -146,7 +151,7 @@ async function checkApartments() {
         }
 
     } catch (error) {
-        console.error("Ошибка во время выполнения проверки:", error);
+        console.error("Ошибка во время выполнения проверки:", error.message || error);
     } finally {
         await browser.close();
     }
@@ -155,7 +160,7 @@ async function checkApartments() {
 // Главный цикл
 async function main() {
     console.log("🤖 Бот на Node.js запущен!");
-    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nДобавлена защита от блокировки всплывающими окнами.");
+    await sendTelegram("🤖 <b>Бот успешно перезапущен!</b>\nИсправлена ошибка чтения базы данных.");
     
     await checkApartments();
     
