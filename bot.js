@@ -1,7 +1,5 @@
 const { chromium } = require('playwright');
 const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 
 // ==========================================
 // НАСТРОЙКИ (Берутся из переменных Railway)
@@ -12,30 +10,11 @@ const INBERLIN_EMAIL = process.env.INBERLIN_EMAIL || "ваш@email.com";
 const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD || "ваш_пароль";
 const CHECK_INTERVAL = 300000; // 5 минут в миллисекундах
 
-const SEEN_FILE = path.join(__dirname, 'seen_apartments.json');
 const BASE_URL = 'https://www.inberlinwohnen.de';
 const APARTMENTS_URL = `${BASE_URL}/wohnungsfinder/`;
 
-// Загрузка базы известных квартир с жесткой проверкой на Set
-let seenApartments = new Set();
-if (fs.existsSync(SEEN_FILE)) {
-    try {
-        const data = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
-        // Гарантируем, что данные превратятся в Set, даже если там массив
-        seenApartments = new Set(Array.isArray(data) ? data : []);
-    } catch (e) {
-        console.error("Ошибка чтения файла seen_apartments.json:", e);
-        seenApartments = new Set();
-    }
-}
-
-function saveSeen() {
-    try {
-        fs.writeFileSync(SEEN_FILE, JSON.stringify(Array.from(seenApartments)), 'utf8');
-    } catch (e) {
-        console.error("Ошибка записи файла:", e);
-    }
-}
+// Теперь храним базу прямо в оперативной памяти процесса
+const memorySeenApartments = new Set();
 
 // Отправка уведомления в Telegram
 async function sendTelegram(text, url = null) {
@@ -62,9 +41,9 @@ async function sendTelegram(text, url = null) {
     }
 }
 
-// Основная функция парсинга через реальный браузер
+// Основная функция парсинга
 async function checkApartments() {
-    console.log(`[${new Date().toLocaleTimeString()}] Проверяю сайт... (уже известно ${seenApartments.size} квартир)`);
+    console.log(`[${new Date().toLocaleTimeString()}] Проверяю сайт... (уже известно ${memorySeenApartments.size} квартир)`);
     
     const browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
@@ -101,15 +80,13 @@ async function checkApartments() {
             await page.fill('input[name="email"]', INBERLIN_EMAIL);
             await page.fill('input[name="password"]', INBERLIN_PASSWORD);
             
-            await page.click('button[type="submit"], input[type="submit"], .btn-login');
+            await page.click('button[type="submit"], input[type="submit"]');
             await page.waitForNavigation({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
             console.log("Выполнен вход в аккаунт");
         }
 
         // 3. Переход к поиску квартир
         await page.goto(APARTMENTS_URL, { waitUntil: 'networkidle', timeout: 30000 });
-        
-        // Ждем подгрузки элементов списка
         await page.waitForSelector('.tb-wfinder__results-item, article, [class*="item"]', { timeout: 10000 }).catch(() => {});
 
         // 4. Сбор элементов квартир
@@ -121,31 +98,31 @@ async function checkApartments() {
         });
 
         let newCount = 0;
-
-        // На всякий случай проверяем, что seenApartments это Set перед циклом
-        if (!(seenApartments instanceof Set)) {
-            seenApartments = new Set(seenApartments);
-        }
+        const isFirstRun = (memorySeenApartments.size === 0);
 
         for (const apt of apartmentLinks) {
             const match = apt.href.match(/\/([0-9]+)\/?$/);
             const aptId = match ? match[1] : apt.href;
 
-            if (aptId && !seenApartments.has(aptId)) {
-                seenApartments.add(aptId);
-                newCount++;
-
-                const timestamp = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
-                const msg = `🏠 <b>Новая квартира!</b>\n\n⏰ ${timestamp}`;
+            if (aptId && !memorySeenApartments.has(aptId)) {
+                memorySeenApartments.add(aptId);
                 
-                await sendTelegram(msg, apt.href);
-                await new Promise(resolve => setTimeout(resolve, 1500));
+                // Если это самый первый запуск бота, мы просто запоминаем квартиры, 
+                // но не шлем спам в ТГ. В ТГ пойдут только реально НОВЫЕ квартиры, которые появятся позже.
+                if (!isFirstRun) {
+                    newCount++;
+                    const timestamp = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
+                    const msg = `🏠 <b>Новая квартира!</b>\n\n⏰ ${timestamp}`;
+                    await sendTelegram(msg, apt.href);
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                }
             }
         }
 
-        if (newCount > 0) {
+        if (isFirstRun) {
+            console.log(`[Первый запуск] Успешно запомнили ${memorySeenApartments.size} существующих квартир. Защита от спама включена.`);
+        } else if (newCount > 0) {
             console.log(`🏠 Найдено ${newCount} новых квартир!`);
-            saveSeen();
         } else {
             console.log("Новых квартир нет.");
         }
@@ -160,7 +137,7 @@ async function checkApartments() {
 // Главный цикл
 async function main() {
     console.log("🤖 Бот на Node.js запущен!");
-    await sendTelegram("🤖 <b>Бот успешно перезапущен!</b>\nИсправлена ошибка чтения базы данных.");
+    await sendTelegram("🤖 <b>Бот успешно обновлен!</b>\nВключена умная память в оперативной системе.");
     
     await checkApartments();
     
