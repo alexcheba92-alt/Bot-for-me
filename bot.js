@@ -15,8 +15,8 @@ const CONFIG = {
   rooms: Number(process.env.ROOMS || 3),
   intervalMs: Number(process.env.INTERVAL_MS || 5 * 60 * 1000),
 
+  baseUrl: 'https://www.inberlinwohnen.de/',
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
-  loginUrl: 'https://www.inberlinwohnen.de/mein-bereich/',
 
   outDir: path.join(__dirname, 'out'),
 };
@@ -36,41 +36,53 @@ async function tgSend(text) {
     await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       chat_id: CONFIG.tgChatId,
       text: String(text).slice(0, 3500),
-    }, { timeout: 20000 });
+    });
   } catch (e) {
     log('TG ERROR:', e.message);
   }
 }
 
+/**
+ * 🔥 FIX: убирает "Download is starting"
+ */
 async function safeGoto(page, url) {
-  try {
-    const res = await page.goto(url, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60000,
-    });
+  const response = await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000
+  });
 
-    if (!res) throw new Error('No response');
-    return res;
-  } catch (e) {
-    log('NAV ERROR:', e.message);
-    throw e;
+  if (!response) return;
+
+  const headers = response.headers?.() || {};
+  const ct = headers['content-type'] || '';
+
+  if (
+    ct.includes('octet-stream') ||
+    headers['content-disposition']
+  ) {
+    throw new Error('BLOCKED DOWNLOAD RESPONSE (site protection)');
   }
+
+  await page.waitForTimeout(1500);
 }
 
 async function closePopups(page) {
   try {
-    const btn = page.locator('button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren")').first();
-    if (await btn.count()) {
-      await btn.click({ force: true }).catch(() => {});
-      await page.waitForTimeout(1000);
-    }
+    await page.locator('button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren")')
+      .first()
+      .click({ force: true })
+      .catch(() => {});
   } catch {}
 }
 
+/**
+ * 🔐 LOGIN FIXED (не через /mein-bereich)
+ */
 async function login(page) {
   log('LOGIN...');
 
-  await safeGoto(page, CONFIG.loginUrl);
+  await safeGoto(page, CONFIG.baseUrl);
+
   await closePopups(page);
 
   const email = page.locator('input[type="email"], input[name*="email"], input[name*="user"], input[type="text"]').first();
@@ -90,32 +102,34 @@ async function login(page) {
     await page.keyboard.press('Enter');
   }
 
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(6000);
 
-  log('LOGIN OK');
+  log('LOGIN DONE:', page.url());
 }
 
+/**
+ * 🔎 FINDER FIX
+ */
 async function scrape(page) {
   log('OPEN FINDER...');
 
   await safeGoto(page, CONFIG.finderUrl);
   await closePopups(page);
 
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(4000);
 
-  // 🔥 ВАЖНО: запускаем поиск
-  const searchBtn = page.locator('button:has-text("Suchen"), button:has-text("Filtern"), button[type="submit"]').first();
+  // 🔥 обязательно запускаем поиск
+  const btn = page.locator('button:has-text("Suchen"), button:has-text("Filtern"), button[type="submit"]').first();
 
-  if (await searchBtn.count()) {
-    await searchBtn.click({ force: true }).catch(() => {});
+  if (await btn.count()) {
+    await btn.click({ force: true }).catch(() => {});
     log('SEARCH CLICKED');
   }
 
   await page.waitForTimeout(7000);
 
-  const cards = await page.evaluate(() => {
+  const results = await page.evaluate(() => {
     const out = [];
-
     const nodes = document.querySelectorAll('a, div, li, article');
 
     for (const el of nodes) {
@@ -138,11 +152,11 @@ async function scrape(page) {
     return out.slice(0, 50);
   });
 
-  const parsed = cards.map(c => ({
-    rooms: (c.text.match(/(\d+(?:[.,]\d+)?)\s*Zimmer/i) || [])[1],
-    size: (c.text.match(/(\d+(?:[.,]\d+)?)\s*m²/i) || [])[1],
-    rent: (c.text.match(/(\d{2,4}(?:[.,]\d+)?)\s*€/i) || [])[1],
-    href: c.href
+  const parsed = results.map(r => ({
+    rooms: (r.text.match(/(\d+(?:[.,]\d+)?)\s*Zimmer/i) || [])[1],
+    size: (r.text.match(/(\d+(?:[.,]\d+)?)\s*m²/i) || [])[1],
+    rent: (r.text.match(/(\d{2,4}(?:[.,]\d+)?)\s*€/i) || [])[1],
+    href: r.href
   }));
 
   const filtered = parsed.filter(x => x.rooms || x.rent || x.size);
@@ -159,19 +173,26 @@ async function run() {
     if (!browser) {
       browser = await chromium.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage']
+        args: [
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+        ]
       });
     }
 
-    const ctx = await browser.newContext();
+    const ctx = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+      locale: 'de-DE',
+      viewport: { width: 1280, height: 800 }
+    });
+
     const page = await ctx.newPage();
 
     await login(page);
-
     const apartments = await scrape(page);
 
     if (!apartments.length) {
-      await tgSend('⚠️ No apartments found (check site structure)');
+      await tgSend('⚠️ No apartments found (site structure changed or blocked)');
       return;
     }
 
