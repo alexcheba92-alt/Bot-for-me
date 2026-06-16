@@ -6,26 +6,26 @@ const fs = require('fs');
 const path = require('path');
 const FormData = require('form-data');
 
-// ======================= CONFIG =======================
+// ================= CONFIG =================
 
 const CONFIG = {
   login:
     process.env.IBW_LOGIN ||
     process.env.INBERLIN_EMAIL ||
-    'EMPTY',
+    '',
 
   password:
     process.env.IBW_PASSWORD ||
     process.env.INBERLIN_PASSWORD ||
-    'EMPTY',
+    '',
 
   tgToken:
     process.env.TELEGRAM_TOKEN ||
-    'EMPTY',
+    '',
 
   tgChatId:
     process.env.TELEGRAM_CHAT_ID ||
-    'EMPTY',
+    '',
 
   maxRent: 600,
   rooms: 3,
@@ -43,7 +43,7 @@ if (!fs.existsSync(CONFIG.outDir)) {
   fs.mkdirSync(CONFIG.outDir, { recursive: true });
 }
 
-// ======================= STATE =======================
+// ================= STATE =================
 
 const STATE_FILE = path.join(CONFIG.outDir, 'state.json');
 
@@ -51,7 +51,7 @@ function loadState() {
   try {
     return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
   } catch {
-    return { apartments: {}, lastCount: null };
+    return { apartments: {}, lastCount: 0 };
   }
 }
 
@@ -61,33 +61,32 @@ function saveState(state) {
 
 let state = loadState();
 
-// ======================= LOG =======================
-
-const LOG_FILE = path.join(CONFIG.outDir, 'bot.log');
+// ================= LOG =================
 
 function log(...args) {
-  const line = `[${new Date().toISOString()}] ${args.join(' ')}`;
-  console.log(line);
-  fs.appendFileSync(LOG_FILE, line + '\n');
+  console.log(new Date().toISOString(), ...args);
 }
 
-// ======================= TELEGRAM =======================
+// ================= TELEGRAM =================
 
-async function tgSend(text, extra = {}) {
+async function tgSend(text) {
+  if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
+
   try {
-    await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
-      chat_id: CONFIG.tgChatId,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true,
-      ...extra,
-    });
+    await axios.post(
+      `https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`,
+      {
+        chat_id: CONFIG.tgChatId,
+        text,
+        parse_mode: 'HTML',
+      }
+    );
   } catch (e) {
-    log('TG error:', e.message);
+    log('TG error', e.message);
   }
 }
 
-// ======================= BROWSER =======================
+// ================= BROWSER =================
 
 let browser;
 
@@ -95,92 +94,95 @@ async function getBrowser() {
   if (!browser) {
     browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-dev-shm-usage'],
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled'
+      ],
     });
   }
   return browser;
 }
 
-// ======================= LOGIN =======================
+// ================= LOGIN =================
 
 async function login(page) {
-  log('Login...');
+  log('LOGIN...');
 
-  await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded' });
+  await page.goto(CONFIG.loginUrl, {
+    waitUntil: 'commit',
+    timeout: 60000,
+  });
 
-  await page.waitForTimeout(2000);
+  await page.waitForTimeout(4000);
 
-  // cookies accept
+  // cookies
   try {
     await page.click('#onetrust-accept-btn-handler', { timeout: 2000 });
   } catch {}
 
-  // email
-  const emailInput = await page.$('input[type="email"], input[name*="log"], input[name*="user"]');
-  if (!emailInput) throw new Error('Email field not found');
+  const email = await page.$('input[type="email"], input[name*="log"], input[name*="user"]');
+  const pass = await page.$('input[type="password"]');
 
-  await emailInput.fill(CONFIG.login);
+  if (!email || !pass) {
+    throw new Error('Login fields not found');
+  }
 
-  // password
-  const passInput = await page.$('input[type="password"]');
-  if (!passInput) throw new Error('Password field not found');
+  await email.fill(CONFIG.login);
+  await pass.fill(CONFIG.password);
 
-  await passInput.fill(CONFIG.password);
-
-  // submit
   const btn = await page.$('button[type="submit"], input[type="submit"]');
   if (btn) await btn.click();
   else await page.keyboard.press('Enter');
-
-  await page.waitForTimeout(4000);
-
-  const ok = await page.content();
-
-  if (!ok.includes('Mein') && !ok.includes('Wohn')) {
-    throw new Error('Login failed');
-  }
-
-  log('Login OK');
-}
-
-// ======================= SCRAPE =======================
-
-async function scrape(page) {
-  log('Opening finder...');
-
-  await page.goto(CONFIG.finderUrl, { waitUntil: 'domcontentloaded' });
 
   await page.waitForTimeout(5000);
 
   const html = await page.content();
 
-  const blocks = html.split('\n');
+  if (!html.includes('Wohn') && !html.includes('Mein')) {
+    throw new Error('Login failed');
+  }
 
-  const apartments = [];
+  log('LOGIN OK');
+}
+
+// ================= SCRAPER =================
+
+async function scrape(page) {
+  log('OPEN FINDER');
+
+  await page.goto(CONFIG.finderUrl, {
+    waitUntil: 'commit',
+    timeout: 60000,
+  });
+
+  await page.waitForTimeout(6000);
+
+  const html = await page.content();
 
   const regex =
     /(\d{1,2})\s*Zimmer.*?(\d{2,3}[.,]\d{0,2})\s*m².*?(\d{3,4}[.,]\d{0,2})\s*€/gms;
 
+  const list = [];
   let m;
 
   while ((m = regex.exec(html)) !== null) {
-    apartments.push({
+    list.push({
       id: m[0],
       rooms: m[1],
       size: m[2],
       rent: m[3],
-      ibwUrl: CONFIG.finderUrl,
     });
   }
 
-  log('Found apartments:', apartments.length);
+  log('FOUND:', list.length);
 
-  return apartments;
+  return list;
 }
 
-// ======================= RUN =======================
+// ================= RUN =================
 
-let firstRun = true;
+let first = true;
 
 async function run() {
   let page;
@@ -196,18 +198,17 @@ async function run() {
 
     const prev = state.apartments || {};
     const prevIds = new Set(Object.keys(prev));
-    const currIds = new Set(apartments.map(a => a.id));
 
     const added = apartments.filter(a => !prevIds.has(a.id));
 
-    if (firstRun) {
-      firstRun = false;
-      await tgSend(`🤖 Bot started. Found: ${apartments.length}`);
+    if (first) {
+      first = false;
+      await tgSend(`🤖 Bot started\nFound: ${apartments.length}`);
     }
 
     for (const a of added) {
       await tgSend(
-        `🏠 NEW:\n${a.rooms} rooms | ${a.size} m² | ${a.rent} €`
+        `🏠 NEW APARTMENT\n${a.rooms} rooms | ${a.size} m² | ${a.rent} €`
       );
     }
 
@@ -219,19 +220,22 @@ async function run() {
 
   } catch (e) {
     log('ERROR:', e.message);
-
-    await tgSend(`⚠️ Error:\n${e.message}`);
+    await tgSend(`⚠️ ERROR:\n${e.message}`);
   } finally {
     if (page) await page.close();
   }
 }
 
-// ======================= START =======================
+// ================= START =================
 
 (async () => {
   log('BOT STARTED');
 
-  await run();
+  if (!CONFIG.login || !CONFIG.password) {
+    log('MISSING CREDENTIALS');
+    return;
+  }
 
+  await run();
   setInterval(run, CONFIG.intervalMs);
 })();
