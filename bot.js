@@ -12,7 +12,6 @@ const OUT = path.resolve('./output');
 if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
 
 async function sendTelegram(text) {
-  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
     await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
       chat_id: TELEGRAM_CHAT_ID,
@@ -26,46 +25,33 @@ async function sendTelegram(text) {
 }
 
 async function acceptCookies(page) {
-  const buttons = [
+  for (const sel of [
     'button:has-text("Alle akzeptieren")',
     '#uc-btn-accept-banner',
     'button:has-text("Accept all")',
     'button:has-text("Akzeptieren")'
-  ];
-  for (const sel of buttons) {
-    const loc = page.locator(sel).first();
+  ]) {
     try {
+      const loc = page.locator(sel).first();
       if (await loc.count()) {
         await loc.click({ timeout: 3000 });
-        return true;
+        return;
       }
     } catch {}
   }
-  return false;
 }
 
 async function login(page) {
-  await page.goto('https://www.inberlinwohnen.de/login/', {
-    waitUntil: 'domcontentloaded',
-    timeout: 60000
-  });
+  await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(1500);
   await acceptCookies(page);
 
-  const email = page.locator('input[type="email"], input[name="email"]').first();
-  const pass = page.locator('input[type="password"], input[name="password"]').first();
+  await page.locator('input[type="email"], input[name="email"]').first().fill(INBERLIN_EMAIL);
+  await page.locator('input[type="password"], input[name="password"]').first().fill(INBERLIN_PASSWORD);
 
-  await email.waitFor({ state: 'visible', timeout: 20000 });
-  await pass.waitFor({ state: 'visible', timeout: 20000 });
-
-  await email.fill(INBERLIN_EMAIL);
-  await pass.fill(INBERLIN_PASSWORD);
-
-  const submit = page.locator('button[type="submit"], input[type="submit"]').first();
   await Promise.allSettled([
     page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
-    submit.click()
+    page.locator('button[type="submit"], input[type="submit"]').first().click()
   ]);
 
   await page.waitForLoadState('networkidle').catch(() => {});
@@ -73,67 +59,36 @@ async function login(page) {
 }
 
 async function openFinder(page) {
+  const apiHits = [];
+  page.on('response', async (resp) => {
+    const url = resp.url();
+    const ct = (resp.headers()['content-type'] || '').toLowerCase();
+    if (resp.request().resourceType() === 'xhr' || resp.request().resourceType() === 'fetch') {
+      apiHits.push({ url, status: resp.status(), ct });
+      console.log('XHR:', resp.status(), ct, url);
+
+      if (ct.includes('application/json')) {
+        try {
+          const txt = await resp.text();
+          fs.writeFileSync(path.join(OUT, 'last_json.txt'), txt);
+        } catch {}
+      }
+    }
+  });
+
   await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', {
     waitUntil: 'domcontentloaded',
     timeout: 60000
   });
+
   await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(3000);
-}
+  await page.waitForTimeout(5000);
 
-async function debugDump(page, name) {
-  await page.screenshot({ path: path.join(OUT, `${name}.png`), fullPage: true }).catch(() => {});
-  fs.writeFileSync(path.join(OUT, `${name}.html`), await page.content());
-  fs.writeFileSync(path.join(OUT, `${name}.txt`), await page.locator('body').innerText().catch(() => ''));
-}
+  fs.writeFileSync(path.join(OUT, 'api_hits.json'), JSON.stringify(apiHits, null, 2));
+  fs.writeFileSync(path.join(OUT, 'finder.html'), await page.content());
+  fs.writeFileSync(path.join(OUT, 'finder.txt'), await page.locator('body').innerText().catch(() => ''));
 
-async function switchToList(page) {
-  const candidates = [
-    'button[aria-label*="List"]',
-    'button:has-text("Liste")',
-    '.aria-icon-list',
-    '[class*="list"]',
-    'button:has(svg)'
-  ];
-  for (const sel of candidates) {
-    const loc = page.locator(sel).first();
-    try {
-      if (await loc.count()) {
-        await loc.click({ timeout: 3000 });
-        await page.waitForTimeout(1500);
-        return true;
-      }
-    } catch {}
-  }
-  return false;
-}
-
-async function collectListings(page) {
-  return await page.evaluate(() => {
-    const out = [];
-    const seen = new Set();
-
-    const items = Array.from(document.querySelectorAll('a, article, li, div'));
-    for (const el of items) {
-      const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
-      if (!t || t.length < 25) continue;
-
-      const hasPrice = /€/.test(t);
-      const hasRooms = /\b\d+(?:[.,]\d+)?\s*Zimmer\b/i.test(t);
-      const hasArea = /\b\d+(?:[.,]\d+)?\s*m²\b/i.test(t);
-
-      if ((hasPrice && hasRooms) || (hasRooms && hasArea)) {
-        const a = el.querySelector('a[href]');
-        const href = a ? a.href : (el.href || '');
-        const key = `${t.slice(0, 220)}|${href}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          out.push({ text: t, href });
-        }
-      }
-    }
-    return out;
-  });
+  await page.screenshot({ path: path.join(OUT, 'finder.png'), fullPage: true }).catch(() => {});
 }
 
 async function main() {
@@ -145,54 +100,30 @@ async function main() {
   const context = await browser.newContext({
     ...devices['iPhone 13 Pro'],
     locale: 'de-DE',
-    timezoneId: 'Europe/Berlin',
-    viewport: { width: 393, height: 852 }
+    timezoneId: 'Europe/Berlin'
   });
 
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
 
   try {
-    await sendTelegram('Бот стартовал, иду проверять объявления.');
-
+    await sendTelegram('Старт диагностики API и списка квартир.');
     await login(page);
     await openFinder(page);
 
-    await switchToList(page);
-    await debugDump(page, 'step_1_finder');
-
-    const title = await page.title().catch(() => '');
     const body = await page.locator('body').innerText().catch(() => '');
+    const match = body.match(/(\d+)\s+Wohnungen|(\d+)\s+Angeboten|(\d+)\s+Objekten/i);
 
-    console.log('TITLE:', title);
-    console.log('BODY HEAD:', body.slice(0, 1200));
-
-    const cards = await collectListings(page);
-
-    if (!cards.length) {
-      await debugDump(page, 'step_2_nocards');
-      await sendTelegram('Страница открылась, но карточки не распознаны. Смотри output/step_1_finder.html и .png.');
-      return;
-    }
-
-    const top = cards.slice(0, 7).map((x, i) => {
-      const txt = x.text.replace(/\s+/g, ' ').slice(0, 280);
-      return `${i + 1}. ${txt}${x.href ? `\n${x.href}` : ''}`;
-    }).join('\n\n');
-
-    fs.writeFileSync(path.join(OUT, 'listings.json'), JSON.stringify(cards, null, 2));
-    await sendTelegram(`Найдено объявлений: <b>${cards.length}</b>\n\n${top}`);
+    await sendTelegram(
+      match
+        ? `Страница открылась. Текст счётчика найден: <b>${match[0]}</b>. Смотри output/api_hits.json и finder.*`
+        : 'Страница открылась, но счётчик не найден. Смотри output/api_hits.json и finder.*'
+    );
   } catch (e) {
-    await debugDump(page, 'error_state');
-    console.error(e);
     await sendTelegram(`Ошибка: ${e.message}`);
   } finally {
     await browser.close();
   }
 }
 
-main().catch(async (e) => {
-  console.error(e);
-  await sendTelegram(`Fatal: ${e.message}`);
-});
-
+main().catch(console.error);
