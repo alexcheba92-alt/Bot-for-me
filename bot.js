@@ -1,23 +1,24 @@
 'use strict';
 
 const { chromium } = require('playwright');
-const axios = require('axios');
 const fs = require('fs');
+const axios = require('axios');
 
 const CONFIG = {
-  login: process.env.INBERLIN_EMAIL,
-  password: process.env.INBERLIN_PASSWORD,
-  tgToken: process.env.TELEGRAM_TOKEN,
-  tgChatId: process.env.TELEGRAM_CHAT_ID,
-
   loginUrl: 'https://www.inberlinwohnen.de/login/',
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
 
-  seenPath: './out/seen_links.json',
+  storagePath: './auth.json',
+  seenPath: './seen.json',
+
+  login: process.env.INBERLIN_EMAIL,
+  password: process.env.INBERLIN_PASSWORD,
+
+  tgToken: process.env.TELEGRAM_TOKEN,
+  tgChatId: process.env.TELEGRAM_CHAT_ID,
+
   intervalMs: 300000
 };
-
-if (!fs.existsSync('./out')) fs.mkdirSync('./out');
 
 let seen = new Set();
 if (fs.existsSync(CONFIG.seenPath)) {
@@ -25,8 +26,6 @@ if (fs.existsSync(CONFIG.seenPath)) {
     seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath)));
   } catch {}
 }
-
-let running = false;
 
 const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
@@ -42,113 +41,93 @@ async function tg(text) {
   }
 }
 
-async function safeGoto(page, url) {
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  } catch (e) {
-    log('NAV WARN:', e.message);
+function isBad(content, headers = {}) {
+  const ct = headers['content-type'] || '';
+  const cd = headers['content-disposition'] || '';
+
+  if (ct.includes('octet-stream')) return true;
+  if (cd.includes('attachment')) return true;
+  if (content.length < 1000) return true;
+
+  return false;
+}
+
+async function loginIfNeeded(page, context) {
+  await page.goto(CONFIG.loginUrl, { waitUntil: 'commit' });
+
+  const alreadyLoggedIn = !page.url().includes('login');
+
+  if (alreadyLoggedIn) {
+    log('SESSION ACTIVE (storageState works)');
+    return;
   }
-}
 
-async function login(page) {
-  log('LOGIN...');
+  log('LOGIN REQUIRED');
 
-  await safeGoto(page, CONFIG.loginUrl);
-
-  const email = page.locator('input[type="email"], input[name="email"]').first();
-  const pass = page.locator('input[type="password"]').first();
-
-  await email.waitFor({ state: 'visible', timeout: 20000 });
-
-  await email.fill(CONFIG.login);
-  await pass.fill(CONFIG.password);
-
-  await page.click('button[type="submit"]').catch(() => {});
-
-  // ждём не навигацию, а факт появления внутреннего контента
-  await page.waitForSelector('a[href*="/expose/"], body', { timeout: 30000 });
-
-  log('LOGIN DONE');
-}
-
-async function extractLinks(page) {
-  await safeGoto(page, CONFIG.finderUrl);
-
-  // ждём именно данные, не сеть
-  await page.waitForSelector('a[href*="/expose/"]', { timeout: 30000 });
+  await page.fill('input[type="email"], input[name="email"]', CONFIG.login);
+  await page.fill('input[type="password"]', CONFIG.password);
+  await page.click('button[type="submit"]');
 
   await page.waitForTimeout(5000);
 
-  const links = await page.$$eval('a[href*="/expose/"]', els =>
-    [...new Set(
-      els
-        .filter(e => e.offsetParent !== null)
-        .map(e => e.href)
-    )]
+  // 🔥 ВАЖНО: сохраняем ТОЛЬКО после успешного логина
+  await context.storageState({ path: CONFIG.storagePath });
+
+  log('SESSION SAVED');
+}
+
+async function runCycle() {
+  const browser = await chromium.launch({ headless: true });
+
+  const context = await browser.newContext(
+    fs.existsSync(CONFIG.storagePath)
+      ? { storageState: CONFIG.storagePath }
+      : undefined
   );
 
-  return links;
-}
-
-async function validate(url) {
-  try {
-    const res = await axios.get(url, {
-      timeout: 8000,
-      validateStatus: () => true
-    });
-
-    const text = (res.data || '').toString().toLowerCase();
-
-    if (res.status !== 200) return false;
-    if (text.includes('nicht gefunden')) return false;
-    if (text.includes('veraltete adresse')) return false;
-
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function run() {
-  if (running) return;
-  running = true;
-
-  log('START CYCLE');
-
-  const browser = await chromium.launch({
-    headless: true
-  });
-
-  const page = await browser.newPage();
+  const page = await context.newPage();
 
   try {
-    await login(page);
+    log('START CYCLE');
 
-    const links = await extractLinks(page);
+    // LOGIN / SESSION
+    await loginIfNeeded(page, context);
 
-    log('FOUND LINKS:', links.length);
+    // FINDER
+    const resp = await page.goto(CONFIG.finderUrl, { waitUntil: 'commit' });
+
+    const headers = resp?.headers() || {};
+    const content = await page.content();
+
+    if (isBad(content, headers)) {
+      throw new Error('BLOCKED_OR_INVALID_RESPONSE');
+    }
+
+    const links = await page.$$eval('a[href*="/expose/"]', els =>
+      [...new Set(
+        els
+          .filter(e => e.offsetParent !== null)
+          .map(e => e.href)
+      )]
+    );
+
+    log('FOUND:', links.length);
 
     for (const url of links) {
       if (seen.has(url)) continue;
 
-      const ok = await validate(url);
-      if (!ok) continue;
-
       seen.add(url);
       fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
 
-      await tg(`🏠 New flat\n🔗 ${url}`);
-      log('SENT:', url);
+      await tg(`🏠 <b>New flat</b>\n${url}`);
     }
 
   } catch (e) {
-    log('CYCLE ERROR:', e.message);
+    log('ERROR:', e.message);
   } finally {
-    await browser.close().catch(() => {});
-    running = false;
-    log('CYCLE END');
+    await browser.close();
   }
 }
 
-run();
-setInterval(run, CONFIG.intervalMs);
+setInterval(runCycle, CONFIG.intervalMs);
+runCycle();
