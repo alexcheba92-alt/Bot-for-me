@@ -1,122 +1,174 @@
 const axios = require('axios');
+const { chromium, devices } = require('playwright');
 const fs = require('fs');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const INBERLIN_EMAIL = process.env.INBERLIN_EMAIL;
+const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD;
 const CHECK_INTERVAL = 300000; // 5 минут
+
 const SEEN_FILE = './seen_apartments.json';
+let seen = new Set();
 
-let seenIds = new Set();
-
-// Загрузка кэша
+// Загружаем старые квартиры из файла, чтобы не спамить одним и тем же при перезапусках Railway
 if (fs.existsSync(SEEN_FILE)) {
     try {
         const data = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
-        seenIds = new Set(data);
-        console.log(`[База] Загружено из памяти квартир: ${seenIds.size}`);
+        seen = new Set(data);
+        console.log(`[База] Загружено из памяти старых ID: ${seen.size}`);
     } catch (e) {
-        console.log('[База] Ошибка чтения файла памяти, создаем чистую.');
+        console.log('[База] Ошибка чтения памяти, создаем чистую.');
     }
 }
 
 function saveCache() {
     try {
-        fs.writeFileSync(SEEN_FILE, JSON.stringify([...seenIds]), 'utf8');
+        fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen]), 'utf8');
     } catch (e) {
-        console.error('[База] Не удалось сохранить кэш:', e.message);
+        console.error('[База] Ошибка сохранения:', e.message);
     }
 }
 
 async function sendTelegram(text, url = null) {
-    const payload = { 
-        chat_id: TELEGRAM_CHAT_ID, 
-        text: text, 
-        parse_mode: 'HTML',
-        disable_web_page_preview: false
-    };
+    const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
     if (url) {
         payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
     }
-    
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload);
-        console.log('📱 Сообщение успешно улетело в Telegram');
+        console.log('✅ Сообщение отправлено в Telegram');
     } catch (e) {
-        console.error('❌ Ошибка отправки в Telegram. Проверь токен и Chat ID!', e.response ? e.response.data : e.message);
+        console.error('❌ Ошибка Telegram (Проверь ID чата и Токен!):', e.message);
     }
 }
 
-async function checkInBerlin() {
-    const timeNow = new Date().toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' });
-    console.log(`\n[${timeNow}] Запуск проверки безбраузерным методом...`);
+async function checkApartments() {
+    const now = new Date().toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' });
+    console.log(`[${now}] Запуск проверки (3 комнаты ≤ 600€ Kaltmiete)...`);
+
+    const browser = await chromium.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+
+    const context = await browser.newContext({
+        ...devices['iPhone 13 Pro'],
+        locale: 'de-DE',
+        timezoneId: 'Europe/Berlin',
+    });
+
+    const page = await context.newPage();
 
     try {
-        // Делаем прямой запрос к обработчику поиска (имитируем форму)
-        // Ищем 3-комнатные квартиры во всем Берлине
-        const response = await axios({
-            method: 'post',
-            url: 'https://www.inberlinwohnen.de/wp-content/themes/ibw/core/finder/housing-finder-controller.php',
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Referer': 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/'
-            },
-            // Параметры запроса: 3 комнаты, лимит цены не ставим жестко в API, отфильтруем в коде для надежности
-            data: 'action=get_housing_results&wub_zimmer_von=3&wub_zimmer_bis=3&wub_miete_bis=600'
+        // Авторизация
+        console.log('Авторизация...');
+        await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForTimeout(2000);
+
+        // Кликаем куки
+        await page.locator('button:has-text("Alle akzeptieren"), #uc-btn-accept-banner').click().catch(() => {});
+
+        if (await page.isVisible('input[name="email"]', { timeout: 10000 })) {
+            await page.fill('input[name="email"]', INBERLIN_EMAIL);
+            await page.fill('input[name="password"]', INBERLIN_PASSWORD);
+            await page.click('button[type="submit"]');
+            await page.waitForTimeout(6000);
+        }
+
+        // Переход на поисковик
+        console.log('Открываю Wohnungsfinder...');
+        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { 
+            waitUntil: 'networkidle', 
+            timeout: 60000 
         });
+        await page.waitForTimeout(4000);
 
-        if (!response.data || typeof response.data !== 'string') {
-            console.log('❌ Сайт вернул пустой или некорректный ответ.');
-            return;
-        }
-
-        // Вытаскиваем ссылки на экспoзе регулярным выражением
-        const matches = [...response.data.matchAll(/href="(https:\/\/www\.inberlinwohnen\.de\/expose\/(\d+)\/)"/g)];
-        
-        console.log(` Найдено сырых совпадений на странице: ${matches.length}`);
-
-        if (matches.length === 0) {
-            console.log(' На сайте сейчас физически нет 3-комнатных квартир до 600€, либо запросы блокируются.');
-            return;
-        }
-
-        let newAptFound = false;
-
-        for (const match of matches) {
-            const fullUrl = match[1];
-            const id = match[2];
-
-            if (!seenIds.has(id)) {
-                seenIds.add(id);
-                newAptFound = true;
-                
-                console.log(`✨ Обнаружена новая квартира! ID: ${id}`);
-                await sendTelegram(`🏠 <b>Найдена новая 3-комнатная квартира!</b>\n\nID объявления: <code>${id}</code>\nЦена: до 600€ Kaltmiete\nПроверено в: ${timeNow}`, fullUrl);
-                await new Promise(r => setTimeout(r, 2000));
+        // === ФИЛЬТРЫ ===
+        console.log('Применяю фильтры...');
+        const mieteSelectors = ['input[name*="miete_bis"]', 'input[id*="miete_bis"]', 'input[placeholder*="Kaltmiete"]'];
+        for (const sel of mieteSelectors) {
+            const input = page.locator(sel).last();
+            if (await input.isVisible({ timeout: 4000 })) {
+                await input.fill('600');
+                break;
             }
         }
 
-        if (newAptFound) {
+        const zimmerSelectors = ['input[name*="zimmer_von"]', 'input[name*="zimmer_bis"]'];
+        for (const sel of zimmerSelectors) {
+            const input = page.locator(sel).first();
+            if (await input.isVisible({ timeout: 4000 })) await input.fill('3');
+        }
+
+        const searchBtn = page.locator('button:has-text("Wohnung suchen"), button[type="submit"]');
+        await searchBtn.click().catch(() => {});
+
+        await page.waitForTimeout(8000);
+
+        // === ОБРАБОТКА КАПЧИ ===
+        const captchaVisible = await page.locator('iframe[src*="captcha"], div[id*="captcha"], .g-recaptcha, #challenge-form').isVisible({ timeout: 3000 }).catch(() => false);
+        if (captchaVisible) {
+            console.log('⚠️ Обнаружена капча! Пропускаем круг.');
+            return;
+        }
+
+        // Парсинг результатов
+        const apartments = await page.evaluate(() => {
+            const results = [];
+            document.querySelectorAll('a').forEach(a => {
+                const href = a.href ? a.href.trim() : '';
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ');
+                if (href && (href.includes('/expose/') || href.includes('detail'))) {
+                    results.push({ href, text: text.substring(0, 120) || 'Квартира' });
+                }
+            });
+            return results;
+        });
+
+        console.log(`Найдено потенциальных ссылок: ${apartments.length}`);
+
+        let newFound = false;
+
+        for (const apt of apartments) {
+            const match = apt.href.match(/expose\/([^/?#]+)/) || apt.href.match(/(\d{5,}-?\d*)/);
+            const id = match ? match[1] : apt.href;
+
+            // ЕСЛИ ЭТОГО ID НЕТ В БАЗЕ — СРАЗУ ШЛЕМ В ТЕЛЕГРАМ
+            if (!seen.has(id)) {
+                seen.add(id);
+                newFound = true;
+                
+                const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
+                await sendTelegram(
+                    `🏠 <b>Найдена квартира (3 Zimmer ≤ 600€)!</b>\n⏰ Время: ${time}\n📝 Описание: ${apt.text}...`,
+                    apt.href
+                );
+                await new Promise(r => setTimeout(r, 2000)); // Пауза, чтобы ТГ не забанил за спам
+            }
+        }
+
+        if (newFound) {
             saveCache();
         } else {
-            console.log(' Ничего нового. Все эти квартиры мы уже видели.');
+            console.log('Новых квартир с момента последней проверки нет.');
         }
 
     } catch (e) {
-        console.error('❌ Ошибка сети при запросе к сайту:', e.message);
+        console.error('❌ Ошибка в цикле:', e.message);
+    } finally {
+        await browser.close();
     }
 }
 
 async function main() {
-    console.log('🤖 Бот стартует...');
+    console.log('🤖 Бот стартует (Браузерный режим)...');
     
-    // ПРИНУДИТЕЛЬНЫЙ ТЕСТ ТЕЛЕГРАМА ПРИ ЗАПУСКЕ
-    // Если это сообщение НЕ придет — значит у тебя 100% указан неверный TELEGRAM_CHAT_ID или токен бота в Railway!
-    await sendTelegram('🚀 <b>Бот-наблюдатель запущен!</b>\nСвязь с Telegram работает отлично. Начинаю мониторинг квартир...');
-
-    await checkInBerlin();
-    setInterval(checkInBerlin, CHECK_INTERVAL);
+    // Сразу проверяем, доходят ли вообще сообщения до твоего ТГ
+    await sendTelegram('🚀 <b>Бот запущен на Railway!</b>\nПроверяю связь. Если ты видишь это сообщение, значит ТГ-канал подключен правильно. Начинаю первый сбор квартир...');
+    
+    await checkApartments();
+    setInterval(checkApartments, CHECK_INTERVAL);
 }
 
 main().catch(console.error);
