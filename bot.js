@@ -15,7 +15,7 @@ function loadSeen() {
     try {
         if (fs.existsSync(SEEN_FILE)) {
             seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
-            console.log(`Загружено ${seen.size} квартир из памяти`);
+            console.log(`Загружено ${seen.size} квартир`);
         }
     } catch (e) {}
 }
@@ -42,38 +42,45 @@ async function checkInberlinwohnen() {
 
     try {
         await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await page.locator('button:has-text("Alle akzeptieren"), #uc-btn-accept-banner').click().catch(() => {});
+        await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
 
-        if (await page.isVisible('input[name="email"]', { timeout: 10000 })) {
+        if (await page.isVisible('input[name="email"]')) {
             await page.fill('input[name="email"]', INBERLIN_EMAIL);
             await page.fill('input[name="password"]', INBERLIN_PASSWORD);
             await page.click('button[type="submit"]');
-            await page.waitForTimeout(5000);
+            await page.waitForTimeout(4000);
         }
 
         await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForTimeout(7000);
+        await page.waitForTimeout(8000);
 
         // Фильтры
         await page.locator('input[name*="miete_bis"], input[placeholder*="Kaltmiete"]').last().fill('600').catch(() => {});
         await page.locator('input[name*="zimmer"]').first().fill('3').catch(() => {});
         await page.locator('button:has-text("Wohnung suchen"), button[type="submit"]').click().catch(() => {});
-        await page.waitForTimeout(10000);
+        await page.waitForTimeout(12000);
 
         const apartments = await page.evaluate(() => {
             const results = [];
             document.querySelectorAll('a').forEach(a => {
-                let href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
-
-                if (href.includes('/expose/') || 
-                    (href.includes('howoge.de') || href.includes('gewobag.de') || href.includes('degewo.de') || href.includes('stadtundland.de')) && 
-                    href.length > 60) {
-                    results.push({ href, text, source: 'Inberlinwohnen' });
+                const href = a.href.trim();
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 150);
+                
+                if (href && href.length > 50 && 
+                    (href.includes('/expose/') || 
+                     href.includes('howoge.de') || 
+                     href.includes('gewobag.de') || 
+                     href.includes('degewo.de') || 
+                     href.includes('stadtundland.de'))) {
+                    
+                    results.push({ href, text });
                 }
             });
             return results;
         });
+
+        console.log(`Найдено квартир: ${apartments.length}`);
+        console.log('Примеры ссылок:', apartments.slice(0, 3).map(a => a.href));
 
         await browser.close();
         return apartments;
@@ -88,7 +95,6 @@ async function checkApartments() {
     console.log(`[${new Date().toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' })}] Тихая проверка...`);
 
     const apartments = await checkInberlinwohnen();
-
     let newCount = 0;
 
     for (const apt of apartments) {
@@ -101,9 +107,8 @@ async function checkApartments() {
             const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
             await sendTelegram(
                 `🚨 <b>НОВАЯ КВАРТИРА!</b> 🏠\n\n` +
-                `📍 ${apt.source}\n` +
                 `🕒 ${time}\n\n` +
-                `🔗 ${apt.href}\n\n` + 
+                `🔗 ${apt.href}\n\n` +
                 `📝 ${apt.text}...\n\n` +
                 `<i>3 Zimmer • bis 600€ Kaltmiete</i>`,
                 apt.href
@@ -115,7 +120,7 @@ async function checkApartments() {
     if (newCount > 0) {
         console.log(`✅ Отправлено ${newCount} новых квартир`);
     } else {
-        console.log('Новых квартир нет');
+        console.log('Новых квартир не найдено (все уже в базе)');
     }
 
     saveSeen();
@@ -123,11 +128,9 @@ async function checkApartments() {
 
 async function main() {
     loadSeen();
-    console.log('🤖 Бот запущен в тихом режиме (Inberlinwohnen)');
+    console.log('🤖 Бот запущен в тихом режиме');
 
-    await sendTelegram(
-        `🤖 <b>Бот мониторинга запущен</b>\n\nОтслеживаю 3-комнатные квартиры ≤ 600€ Kaltmiete\nУведомления только при новых вариантах.`
-    );
+    await sendTelegram(`🤖 <b>Бот перезапущен</b>\nБаза очищена. Начинаем мониторинг заново.`);
 
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
