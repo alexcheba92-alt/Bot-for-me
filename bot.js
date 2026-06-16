@@ -1,133 +1,132 @@
 'use strict';
 
 const { chromium } = require('playwright');
-const fs = require('fs');
 const axios = require('axios');
+const fs = require('fs');
 
 const CONFIG = {
-  loginUrl: 'https://www.inberlinwohnen.de/login/',
-  finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
-
-  storagePath: './auth.json',
-  seenPath: './seen.json',
-
-  login: process.env.INBERLIN_EMAIL,
-  password: process.env.INBERLIN_PASSWORD,
-
-  tgToken: process.env.TELEGRAM_TOKEN,
-  tgChatId: process.env.TELEGRAM_CHAT_ID,
-
-  intervalMs: 300000
+    loginUrl: 'https://www.inberlinwohnen.de/login/',
+    finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
+    login: process.env.INBERLIN_EMAIL,
+    password: process.env.INBERLIN_PASSWORD,
+    tgToken: process.env.TELEGRAM_TOKEN,
+    tgChatId: process.env.TELEGRAM_CHAT_ID,
+    intervalMs: 300000,
+    seenPath: './out/seen.json'
 };
 
 let seen = new Set();
 if (fs.existsSync(CONFIG.seenPath)) {
-  try {
-    seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath)));
-  } catch {}
+    try {
+        seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath)));
+    } catch {}
 }
-
-const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
 async function tg(text) {
-  try {
-    await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
-      chat_id: CONFIG.tgChatId,
-      text,
-      parse_mode: 'HTML'
-    });
-  } catch (e) {
-    log('TG ERROR:', e.message);
-  }
+    if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
+    try {
+        await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
+            chat_id: CONFIG.tgChatId,
+            text
+        });
+    } catch (e) {
+        console.log('[TG ERROR]', e.message);
+    }
 }
 
-function isBad(content, headers = {}) {
-  const ct = headers['content-type'] || '';
-  const cd = headers['content-disposition'] || '';
-
-  if (ct.includes('octet-stream')) return true;
-  if (cd.includes('attachment')) return true;
-  if (content.length < 1000) return true;
-
-  return false;
+function log(...args) {
+    console.log(`[${new Date().toISOString()}]`, ...args);
 }
 
-async function loginIfNeeded(page, context) {
-  await page.goto(CONFIG.loginUrl, { waitUntil: 'commit' });
+async function safeGoto(page, url) {
+    try {
+        const response = await page.goto(url, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45000
+        });
 
-  const alreadyLoggedIn = !page.url().includes('login');
+        if (!response) return { ok: false, reason: 'NO_RESPONSE' };
 
-  if (alreadyLoggedIn) {
-    log('SESSION ACTIVE (storageState works)');
-    return;
-  }
+        const headers = response.headers();
+        const ct = headers['content-type'] || '';
+        const cd = headers['content-disposition'] || '';
 
-  log('LOGIN REQUIRED');
+        if (
+            ct.includes('octet-stream') ||
+            ct.includes('application/pdf') ||
+            cd.includes('attachment')
+        ) {
+            return { ok: false, reason: 'FILE_RESPONSE' };
+        }
 
-  await page.fill('input[type="email"], input[name="email"]', CONFIG.login);
-  await page.fill('input[type="password"]', CONFIG.password);
-  await page.click('button[type="submit"]');
+        return { ok: true };
 
-  await page.waitForTimeout(5000);
-
-  // 🔥 ВАЖНО: сохраняем ТОЛЬКО после успешного логина
-  await context.storageState({ path: CONFIG.storagePath });
-
-  log('SESSION SAVED');
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
 }
 
 async function runCycle() {
-  const browser = await chromium.launch({ headless: true });
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
 
-  const context = await browser.newContext(
-    fs.existsSync(CONFIG.storagePath)
-      ? { storageState: CONFIG.storagePath }
-      : undefined
-  );
+    try {
+        log('START CYCLE');
 
-  const page = await context.newPage();
+        // LOGIN PAGE
+        const loginNav = await safeGoto(page, CONFIG.loginUrl);
+        if (!loginNav.ok) {
+            log('LOGIN NAV FAILED:', loginNav.reason);
+            await tg(`⚠️ LOGIN FAILED: ${loginNav.reason}`);
+            return;
+        }
 
-  try {
-    log('START CYCLE');
+        await page.fill('input[type="email"], input[name="email"]', CONFIG.login);
+        await page.fill('input[type="password"]', CONFIG.password);
+        await page.click('button[type="submit"]');
 
-    // LOGIN / SESSION
-    await loginIfNeeded(page, context);
+        await page.waitForTimeout(5000);
 
-    // FINDER
-    const resp = await page.goto(CONFIG.finderUrl, { waitUntil: 'commit' });
+        // FINDER PAGE
+        const finderNav = await safeGoto(page, CONFIG.finderUrl);
+        if (!finderNav.ok) {
+            log('FINDER NAV FAILED:', finderNav.reason);
+            await tg(`⚠️ FINDER FAILED: ${finderNav.reason}`);
+            return;
+        }
 
-    const headers = resp?.headers() || {};
-    const content = await page.content();
+        await page.waitForSelector('a[href*="/expose/"]', { timeout: 20000 });
 
-    if (isBad(content, headers)) {
-      throw new Error('BLOCKED_OR_INVALID_RESPONSE');
+        const links = await page.$$eval('a[href*="/expose/"]', els =>
+            [...new Set(els.map(e => e.href))]
+        );
+
+        log('FOUND:', links.length);
+
+        for (const url of links) {
+            if (seen.has(url)) continue;
+
+            seen.add(url);
+            fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
+
+            await tg(`🏠 New flat:\n${url}`);
+        }
+
+    } catch (e) {
+        log('CYCLE ERROR:', e.message);
+    } finally {
+        await browser.close();
     }
-
-    const links = await page.$$eval('a[href*="/expose/"]', els =>
-      [...new Set(
-        els
-          .filter(e => e.offsetParent !== null)
-          .map(e => e.href)
-      )]
-    );
-
-    log('FOUND:', links.length);
-
-    for (const url of links) {
-      if (seen.has(url)) continue;
-
-      seen.add(url);
-      fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
-
-      await tg(`🏠 <b>New flat</b>\n${url}`);
-    }
-
-  } catch (e) {
-    log('ERROR:', e.message);
-  } finally {
-    await browser.close();
-  }
 }
 
-setInterval(runCycle, CONFIG.intervalMs);
-runCycle();
+async function startService() {
+    log('SERVICE STARTED');
+
+    while (true) {
+        await runCycle().catch(e => log('FATAL:', e.message));
+
+        await new Promise(r => setTimeout(r, CONFIG.intervalMs));
+    }
+}
+
+startService();
