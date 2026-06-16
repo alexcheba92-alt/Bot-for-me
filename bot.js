@@ -10,10 +10,7 @@ const CONFIG = {
   password: process.env.INBERLIN_PASSWORD || '',
   tgToken: process.env.TELEGRAM_TOKEN || '',
   tgChatId: process.env.TELEGRAM_CHAT_ID || '',
-
-  maxRent: Number(process.env.MAX_RENT || 600),
-  rooms: Number(process.env.ROOMS || 3),
-  intervalMs: Number(process.env.INTERVAL_MS || 300000),
+  intervalMs: 300000,
 
   loginUrl: 'https://www.inberlinwohnen.de/login/',
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
@@ -23,58 +20,42 @@ const CONFIG = {
 
 if (!fs.existsSync(CONFIG.outDir)) fs.mkdirSync(CONFIG.outDir, { recursive: true });
 
-const logFile = path.join(CONFIG.outDir, 'bot.log');
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
-function log(...args) {
-  const line = `[${new Date().toISOString()}] ` + args.join(' ');
-  console.log(line);
-  fs.appendFileSync(logFile, line + '\n');
-}
-
-/* ================= TELEGRAM FIX ================= */
+/* ================= TELEGRAM SAFE ================= */
 
 async function tgSend(text) {
-  if (!CONFIG.tgToken || !CONFIG.tgChatId) {
-    log('TG SKIP: missing token/chatId');
-    return;
-  }
+  if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
 
   try {
-    await axios.post(
-      `https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`,
-      {
-        chat_id: String(CONFIG.tgChatId),
-        text: String(text).slice(0, 3800),
-      },
-      { timeout: 20000 }
-    );
+    await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
+      chat_id: String(CONFIG.tgChatId),
+      text: String(text).slice(0, 3900),
+    });
   } catch (e) {
-    log('TG ERROR:', e.response?.data ? JSON.stringify(e.response.data) : e.message);
+    log('TG ERROR', e.response?.data || e.message);
   }
 }
 
-/* ================= FIX: DOWNLOAD BLOCK ================= */
+/* ================= STEALTH BROWSER ================= */
 
-async function createContext(browser) {
-  const context = await browser.newContext();
-
-  // 🔥 КЛЮЧЕВОЙ ФИКС: убирает "Download is starting"
-  await context.route('**/*', (route) => {
-    const req = route.request();
-    const resource = req.resourceType();
-
-    // блокируем странные download/attachment ответы
-    if (resource === 'document' && req.headers()['content-disposition']) {
-      return route.abort();
-    }
-
-    route.continue();
+async function createBrowser() {
+  const browser = await chromium.launch({
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-web-security',
+      '--disable-features=IsolateOrigins,site-per-process',
+    ],
   });
 
-  return context;
+  return browser;
 }
 
-/* ================= SAFE NAV ================= */
+/* ================= FIX NAV (DOWNLOAD BUG) ================= */
 
 async function safeGoto(page, url) {
   log('NAVIGATE:', url);
@@ -82,111 +63,96 @@ async function safeGoto(page, url) {
   try {
     const res = await page.goto(url, {
       waitUntil: 'domcontentloaded',
-      timeout: 60000,
+      timeout: 90000,
     });
 
     if (!res) throw new Error('NO RESPONSE');
 
-    const headers = res.headers();
-    if (headers['content-disposition']) {
-      throw new Error('BLOCKED DOWNLOAD RESPONSE');
+    const ct = res.headers()['content-type'] || '';
+
+    // 🔥 CRITICAL FIX
+    if (!ct.includes('text/html')) {
+      log('NON HTML DETECTED → forcing reload');
+      await page.goto(url, { waitUntil: 'load', timeout: 90000 });
     }
 
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(5000);
   } catch (e) {
-    log('NAV FAIL:', e.message);
+    if (e.message.includes('Download is starting')) {
+      log('DOWNLOAD BLOCK → retry hard reload');
+
+      await page.evaluate((u) => (location.href = u), url);
+      await page.waitForTimeout(8000);
+      return;
+    }
+
     throw e;
   }
 }
 
-/* ================= LOGIN (ROBUST) ================= */
+/* ================= ANTI BOT MASK ================= */
+
+async function stealth(page) {
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false });
+    window.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'languages', { get: () => ['de-DE', 'de'] });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+  });
+}
+
+/* ================= LOGIN ================= */
 
 async function login(page) {
   log('LOGIN...');
 
   await safeGoto(page, CONFIG.loginUrl);
 
-  await page.waitForTimeout(3000);
+  await page.waitForTimeout(6000);
 
-  const emailSelectors = [
-    'input[type="email"]',
-    'input[name*="email"]',
-    'input[name*="user"]',
-    'input[name*="login"]',
-  ];
+  const email = await page.$('input[type="email"], input[name*="mail"], input[name*="user"]');
+  const pass = await page.$('input[type="password"]');
 
-  const passSelectors = [
-    'input[type="password"]',
-    'input[name*="pass"]',
-  ];
-
-  let emailInput, passInput;
-
-  for (const s of emailSelectors) {
-    const el = page.locator(s).first();
-    if (await el.count().catch(() => 0)) {
-      emailInput = el;
-      break;
-    }
+  if (!email || !pass) {
+    await page.screenshot({ path: path.join(CONFIG.outDir, 'login_fail.png') });
+    throw new Error('LOGIN FORM NOT FOUND');
   }
 
-  for (const s of passSelectors) {
-    const el = page.locator(s).first();
-    if (await el.count().catch(() => 0)) {
-      passInput = el;
-      break;
-    }
-  }
+  await email.fill(CONFIG.login);
+  await pass.fill(CONFIG.password);
 
-  if (!emailInput || !passInput) {
-    await page.screenshot({ path: path.join(CONFIG.outDir, 'login_error.png') });
-    throw new Error('LOGIN FIELDS NOT FOUND (site changed or iframe)');
-  }
+  await page.keyboard.press('Enter');
 
-  await emailInput.fill(CONFIG.login);
-  await passInput.fill(CONFIG.password);
+  await page.waitForTimeout(8000);
 
-  const btn = page.locator('button[type="submit"], input[type="submit"]').first();
-
-  if (await btn.count()) {
-    await Promise.allSettled([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
-      btn.click({ force: true }),
-    ]);
-  } else {
-    await page.keyboard.press('Enter');
-  }
-
-  await page.waitForTimeout(4000);
-
-  log('LOGIN DONE URL:', page.url());
+  log('LOGIN DONE:', page.url());
 }
 
-/* ================= SCRAPE FIX ================= */
+/* ================= SCRAPER ================= */
 
 async function scrape(page) {
-  log('OPEN FINDER...');
+  log('OPEN FINDER');
 
   await safeGoto(page, CONFIG.finderUrl);
 
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(8000);
 
-  const cards = await page.evaluate(() => {
-    const texts = Array.from(document.querySelectorAll('a, article, li, div'))
-      .map(el => (el.innerText || '').replace(/\s+/g, ' ').trim())
-      .filter(t => t.length > 60);
+  const data = await page.evaluate(() => {
+    const els = [...document.querySelectorAll('div, article, li')];
 
-    return texts.filter(t =>
-      /\d+\s*Zimmer/i.test(t) &&
-      /\d+\s*m²/i.test(t)
-    ).slice(0, 20);
+    return els
+      .map(e => (e.innerText || '').replace(/\s+/g, ' ').trim())
+      .filter(t =>
+        t.length > 80 &&
+        /\d+\s*Zimmer/i.test(t) &&
+        /\d+\s*m²/i.test(t)
+      )
+      .slice(0, 30);
   });
 
-  const parsed = cards.map(t => ({ text: t }));
+  log('FOUND:', data.length);
 
-  log('FOUND:', parsed.length);
-
-  return parsed;
+  return data;
 }
 
 /* ================= MAIN ================= */
@@ -195,43 +161,45 @@ let browser;
 
 async function run() {
   try {
-    if (!browser) {
-      browser = await chromium.launch({
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-dev-shm-usage',
-        ],
-      });
-    }
+    if (!browser) browser = await createBrowser();
 
-    const ctx = await createContext(browser);
-    const page = await ctx.newPage();
+    const context = await browser.newContext({
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+      locale: 'de-DE',
+      viewport: { width: 1366, height: 768 },
+    });
+
+    const page = await context.newPage();
+
+    await stealth(page);
 
     await login(page);
+
     const data = await scrape(page);
 
-    const msg = data.length
-      ? `🏠 Found: ${data.length}`
-      : `⚠️ No apartments found`;
+    await tgSend(
+      data.length
+        ? `🏠 FOUND: ${data.length}`
+        : `⚠️ No apartments (blocked or empty DOM)`
+    );
 
-    await tgSend(msg);
-
+    await page.close();
   } catch (e) {
     log('ERROR:', e.message);
     await tgSend('⚠️ ERROR:\n' + e.message);
   }
 }
 
+/* ================= LOOP ================= */
+
 (async () => {
   log('BOT STARTED');
 
   if (!CONFIG.login || !CONFIG.password) {
-    log('MISSING CREDENTIALS');
-    process.exit(1);
+    throw new Error('Missing credentials');
   }
 
   await run();
-
   setInterval(run, CONFIG.intervalMs);
 })();
