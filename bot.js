@@ -12,137 +12,136 @@ const CONFIG = {
   tgChatId: process.env.TELEGRAM_CHAT_ID || '',
   maxRent: Number(process.env.MAX_RENT || 600),
   rooms: Number(process.env.ROOMS || 3),
-  intervalMs: Number(process.env.INTERVAL_MS || 300000),
+  intervalMs: 300000,
 
   loginUrl: 'https://www.inberlinwohnen.de/',
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
-  outDir: path.join(__dirname, 'out'),
 };
 
-if (!fs.existsSync(CONFIG.outDir)) fs.mkdirSync(CONFIG.outDir, { recursive: true });
-
 function log(...a) {
-  const line = `[${new Date().toISOString()}] ${a.join(' ')}`;
-  console.log(line);
+  console.log(`[${new Date().toISOString()}]`, ...a);
 }
 
-// ---------------- TELEGRAM ----------------
+// ---------------- TELEGRAM FIX ----------------
 async function tgSend(text) {
-  if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
+  if (!CONFIG.tgToken || !CONFIG.tgChatId) {
+    log('TG SKIPPED (missing config)');
+    return;
+  }
 
   try {
     await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       chat_id: CONFIG.tgChatId,
       text: String(text).slice(0, 3500),
-      parse_mode: 'HTML',
-    });
+      parse_mode: 'HTML'
+    }, { timeout: 15000 });
+
   } catch (e) {
-    log('TG ERROR', e.message);
+    log('TG ERROR:', e.response?.data || e.message);
   }
-}
-
-// ---------------- SAFE LOAD (NO goto CRASH) ----------------
-async function safeLoad(page, url) {
-  log('LOAD (safe):', url);
-
-  const res = await page.evaluate(async (u) => {
-    const r = await fetch(u, {
-      credentials: 'include',
-      headers: {
-        'user-agent': navigator.userAgent
-      }
-    });
-    return await r.text();
-  }, url);
-
-  if (!res || res.length < 1000) {
-    throw new Error('BLOCKED OR EMPTY RESPONSE');
-  }
-
-  await page.setContent(res, { waitUntil: 'domcontentloaded' });
 }
 
 // ---------------- LOGIN ----------------
 async function login(page) {
   log('LOGIN...');
 
-  await safeLoad(page, CONFIG.loginUrl);
+  await page.goto(CONFIG.loginUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000
+  });
+
+  await page.waitForTimeout(4000);
 
   const email = page.locator('input[type="email"], input[name*="email"], input[name*="user"], input[name*="log"]').first();
   const pass = page.locator('input[type="password"]').first();
 
-  if (!(await email.isVisible().catch(() => false))) {
-    log('LOGIN FORM NOT FOUND → skipping login');
-    return;
+  if (await email.isVisible().catch(() => false)) {
+    await email.fill(CONFIG.login);
+    await pass.fill(CONFIG.password);
+
+    const btn = page.locator('button[type="submit"], input[type="submit"]').first();
+    if (await btn.count()) {
+      await btn.click();
+    } else {
+      await page.keyboard.press('Enter');
+    }
+
+    await page.waitForTimeout(5000);
   }
 
-  await email.fill(CONFIG.login);
-  await pass.fill(CONFIG.password);
-
-  const btn = page.locator('button[type="submit"], input[type="submit"]').first();
-
-  if (await btn.count().catch(() => 0)) {
-    await btn.click().catch(() => {});
-  } else {
-    await page.keyboard.press('Enter');
-  }
-
-  await page.waitForTimeout(4000);
+  log('LOGIN DONE →', page.url());
 }
 
-// ---------------- SCRAPE ----------------
+// ---------------- SCRAPE REAL DOM ----------------
 async function scrape(page) {
-  log('SCRAPE...');
+  log('OPEN FINDER');
 
-  await safeLoad(page, CONFIG.finderUrl);
-
-  await page.waitForTimeout(4000);
-
-  const data = await page.evaluate(() => {
-    const out = [];
-
-    document.querySelectorAll('article, li, div').forEach(el => {
-      const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
-      if (!t || t.length < 60) return;
-
-      if (!/\d+\s*Zimmer/i.test(t) && !/\d+\s*€/i.test(t)) return;
-
-      const a = el.querySelector?.('a[href]');
-      out.push({
-        text: t,
-        href: a ? a.href : ''
-      });
-    });
-
-    return out;
+  await page.goto(CONFIG.finderUrl, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000
   });
 
-  return data.map(x => {
-    const r = x.text.match(/(\d+(?:[.,]\d+)?)\s*Zimmer/i);
-    const s = x.text.match(/(\d+(?:[.,]\d+)?)\s*m²/i);
-    const p = x.text.match(/(\d+(?:[.,]\d+)?)\s*€/i);
+  await page.waitForTimeout(7000);
+
+  const cards = await page.evaluate(() => {
+    const items = [];
+    const els = document.querySelectorAll('article, li, div');
+
+    for (const el of els) {
+      const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+
+      if (!text || text.length < 70) continue;
+
+      const hasRooms = /\d+\s*Zimmer/i.test(text);
+      const hasPrice = /\d+\s*€/i.test(text);
+      const hasSize = /\d+\s*m²/i.test(text);
+
+      if (!hasRooms && !hasPrice && !hasSize) continue;
+
+      const a = el.querySelector('a[href]');
+      items.push({
+        text,
+        href: a ? a.href : ''
+      });
+    }
+
+    return items;
+  });
+
+  return cards.map(c => {
+    const r = c.text.match(/(\d+)\s*Zimmer/i);
+    const s = c.text.match(/(\d+)\s*m²/i);
+    const p = c.text.match(/(\d+)\s*€/i);
 
     return {
-      rooms: r ? r[1] : '',
-      size: s ? s[1] : '',
-      rent: p ? p[1] : '',
-      href: x.href,
+      rooms: r?.[1] || '',
+      size: s?.[1] || '',
+      rent: p?.[1] || '',
+      href: c.href
     };
   });
 }
 
 // ---------------- RUN ----------------
 async function run() {
-  let browser, page;
+  let browser;
 
   try {
     browser = await chromium.launch({
       headless: true,
-      args: ['--no-sandbox', '--disable-dev-shm-usage']
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled'
+      ]
     });
 
-    const ctx = await browser.newContext();
-    page = await ctx.newPage();
+    const ctx = await browser.newContext({
+      locale: 'de-DE',
+      viewport: { width: 1280, height: 800 }
+    });
+
+    const page = await ctx.newPage();
 
     await login(page);
 
@@ -167,7 +166,6 @@ async function run() {
     log('ERROR:', e.message);
     await tgSend('⚠️ ERROR:\n' + e.message);
   } finally {
-    try { await page?.close(); } catch {}
     try { await browser?.close(); } catch {}
   }
 }
@@ -175,6 +173,12 @@ async function run() {
 // ---------------- START ----------------
 (async () => {
   log('BOT STARTED');
+
+  if (!CONFIG.login || !CONFIG.password) {
+    log('MISSING ENV');
+    process.exit(1);
+  }
+
   await run();
   setInterval(run, CONFIG.intervalMs);
 })();
