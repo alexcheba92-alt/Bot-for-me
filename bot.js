@@ -37,59 +37,6 @@ async function sendTelegram(text, url = null) {
     } catch (e) { console.error('TG:', e.message); }
 }
 
-async function login(page) {
-    console.log('Открываю страницу логина...');
-    await page.goto('https://www.inberlinwohnen.de/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(2000);
-
-    // Закрываем cookie если есть
-    for (const sel of ['#uc-btn-accept-banner', 'button:has-text("Alle akzeptieren")', 'button:has-text("Auswahl erlauben")']) {
-        try {
-            const btn = page.locator(sel).first();
-            if (await btn.isVisible({ timeout: 2000 })) {
-                await btn.click();
-                await page.waitForTimeout(1000);
-                break;
-            }
-        } catch (_) {}
-    }
-
-    // Ждём поля email
-    await page.waitForSelector('input[name="email"]', { timeout: 10000 });
-    console.log('Поле email найдено, вводим данные...');
-
-    // Очищаем и вводим email
-    await page.click('input[name="email"]');
-    await page.keyboard.selectAll();
-    await page.keyboard.type(INBERLIN_EMAIL, { delay: 50 });
-
-    // Очищаем и вводим пароль
-    await page.click('input[name="password"]');
-    await page.keyboard.selectAll();
-    await page.keyboard.type(INBERLIN_PASSWORD, { delay: 50 });
-
-    console.log('Данные введены, нажимаю Enter...');
-
-    // Нажимаем Enter вместо кнопки — надёжнее
-    await page.keyboard.press('Enter');
-    await page.waitForTimeout(5000);
-
-    const url = page.url();
-    console.log('URL после логина:', url);
-
-    if (url.includes('/login')) {
-        // Попробуем ещё раз через кнопку
-        console.log('Всё ещё на логине, пробую кнопку...');
-        try {
-            await page.click('button[type="submit"]');
-            await page.waitForTimeout(5000);
-        } catch(e) {}
-        console.log('URL после кнопки:', page.url());
-    }
-
-    return !page.url().includes('/login');
-}
-
 async function getApartments() {
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
     const context = await browser.newContext({
@@ -100,37 +47,57 @@ async function getApartments() {
     const page = await context.newPage();
 
     try {
-        const loggedIn = await login(page);
-        
-        if (!loggedIn) {
-            console.log('ОШИБКА: Не удалось войти!');
-            // Диагностика — что на странице?
+        // Логин
+        await page.goto('https://www.inberlinwohnen.de/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+        await page.waitForTimeout(2000);
+
+        // Закрываем cookie
+        try {
+            const cookie = page.locator('button:has-text("Alle akzeptieren")').first();
+            if (await cookie.isVisible({ timeout: 3000 })) {
+                await cookie.click();
+                await page.waitForTimeout(1000);
+            }
+        } catch (_) {}
+
+        // Вводим email и пароль через fill (самый надёжный способ)
+        await page.waitForSelector('input[name="email"]', { timeout: 10000 });
+        await page.fill('input[name="email"]', INBERLIN_EMAIL);
+        await page.fill('input[name="password"]', INBERLIN_PASSWORD);
+        console.log('Данные введены, нажимаю Enter...');
+        await page.press('input[name="password"]', 'Enter');
+        await page.waitForTimeout(6000);
+
+        const afterLoginUrl = page.url();
+        console.log('URL после логина:', afterLoginUrl);
+
+        if (afterLoginUrl.includes('/login')) {
+            console.log('Логин не прошёл!');
             if (!diagDone) {
                 diagDone = true;
-                const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500));
-                await sendTelegram(`❌ <b>Не могу войти на сайт!</b>\n\nСтраница показывает:\n${bodyText}\n\nПроверь email и пароль в переменных Railway.`);
+                await sendTelegram('❌ Не могу войти на сайт. Проверь INBERLIN_EMAIL и INBERLIN_PASSWORD в переменных Railway.');
             }
             return new Map();
         }
 
-        console.log('Успешно вошёл! Открываю страницу с квартирами...');
+        console.log('Вошёл! Открываю квартиры...');
         await page.goto(SEARCH_URL, { waitUntil: 'networkidle', timeout: 60000 });
 
-        // Ждём Zimmer на странице
+        // Ждём загрузки квартир
         try {
             await page.waitForFunction(() => document.body.innerText.includes('Zimmer'), { timeout: 30000 });
-            console.log('Квартиры загружены!');
+            console.log('Zimmer найден на странице');
         } catch(e) {
-            console.log('Zimmer не появился за 30 сек');
+            console.log('Zimmer не появился');
         }
 
         await page.waitForTimeout(3000);
 
-        // Диагностика после успешного входа
+        // Диагностика один раз
         if (!diagDone) {
             diagDone = true;
             const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 600));
-            await sendTelegram(`✅ <b>Вход выполнен!</b>\n\nВот что видит бот:\n${bodyText}`);
+            await sendTelegram(`✅ <b>Вход выполнен!</b>\n\nВот что видит бот:\n<code>${bodyText}</code>`);
         }
 
         // Читаем квартиры
@@ -144,7 +111,7 @@ async function getApartments() {
                 const link = el.querySelector('a[href]');
                 const href = link ? link.href : '';
                 const idMatch = href.match(/\/expose\/(\d+)/);
-                const id = idMatch ? idMatch[1] : ('li_' + text.substring(0, 40).replace(/\s/g,''));
+                const id = idMatch ? idMatch[1] : ('li_' + text.substring(0, 40).replace(/\s/g, ''));
                 if (!seen.has(id)) {
                     seen.add(id);
                     results.push({ id, href, text: text.trim().replace(/\s+/g, ' ').substring(0, 200) });
