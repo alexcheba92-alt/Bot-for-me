@@ -1,5 +1,6 @@
 'use strict';
 
+const { chromium } = require('playwright');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -28,13 +29,8 @@ const CONFIG = {
   loginUrl: 'https://www.inberlinwohnen.de/mein-bereich/',
   finderUrl: 'https://www.inberlinwohnen.de/wohnungsfinder/',
 
-  baseUrl: 'https://www.inberlinwohnen.de',
   outDir: path.join(__dirname, 'out'),
 };
-
-if (!fs.existsSync(CONFIG.outDir)) {
-  fs.mkdirSync(CONFIG.outDir, { recursive: true });
-}
 
 // ================= LOG =================
 
@@ -53,142 +49,154 @@ async function tgSend(text) {
       {
         chat_id: CONFIG.tgChatId,
         text,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
       }
     );
   } catch (e) {
-    log('TG ERROR:', e.message);
+    log('TG ERROR', e.message);
   }
 }
 
-// ================= HTTP CLIENT =================
+// ================= BROWSER (FIXED) =================
 
-const http = axios.create({
-  timeout: 60000,
-  headers: {
-    'User-Agent':
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
-    'Accept-Language': 'de-DE,de;q=0.9,en;q=0.8',
-  },
-});
+let browser;
 
-// ================= LOGIN (COOKIE BASED) =================
-
-let cookies = '';
-
-async function login() {
-  log('LOGIN (HTTP)...');
-
-  try {
-    const res = await http.get(CONFIG.loginUrl);
-
-    cookies = res.headers['set-cookie']
-      ? res.headers['set-cookie'].map(c => c.split(';')[0]).join('; ')
-      : '';
-
-    log('Got cookies:', cookies ? 'YES' : 'NO');
-
-  } catch (e) {
-    throw new Error('Login request failed: ' + e.message);
+async function getBrowser() {
+  if (!browser) {
+    browser = await chromium.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-blink-features=AutomationControlled',
+        '--disable-web-security'
+      ],
+    });
   }
+  return browser;
 }
 
-// ================= FETCH PAGE =================
+// ================= SAFE GOTO (CRITICAL FIX) =================
 
-async function fetchPage(url) {
-  const res = await http.get(url, {
-    headers: {
-      Cookie: cookies,
-    },
+async function safeGoto(page, url) {
+  const response = await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
   });
 
-  return res.data;
+  if (!response) {
+    throw new Error('No response from server');
+  }
+
+  const headers = response.headers();
+
+  log('STATUS:', response.status());
+  log('CONTENT-TYPE:', headers['content-type']);
+
+  // FIX for "Download is starting"
+  if (headers['content-disposition']) {
+    throw new Error('Download response detected (blocked page)');
+  }
+
+  return response;
 }
 
-// ================= PARSE APARTMENTS =================
+// ================= LOGIN =================
 
-function parse(html) {
-  const list = [];
+async function login(page) {
+  log('LOGIN...');
+
+  await safeGoto(page, CONFIG.loginUrl);
+
+  await page.waitForTimeout(5000);
+
+  const email = await page.$('input[type="email"], input[name*="log"], input[name*="user"]');
+  const pass = await page.$('input[type="password"]');
+
+  if (!email || !pass) {
+    throw new Error('Login form not found');
+  }
+
+  await email.fill(CONFIG.login);
+  await pass.fill(CONFIG.password);
+
+  const btn = await page.$('button[type="submit"], input[type="submit"]');
+
+  if (btn) await btn.click();
+  else await page.keyboard.press('Enter');
+
+  await page.waitForTimeout(6000);
+
+  const html = await page.content();
+
+  if (!html.includes('Wohn') && !html.includes('Mein')) {
+    throw new Error('Login failed');
+  }
+
+  log('LOGIN OK');
+}
+
+// ================= SCRAPE =================
+
+async function scrape(page) {
+  log('OPEN FINDER');
+
+  await safeGoto(page, CONFIG.finderUrl);
+
+  await page.waitForTimeout(6000);
+
+  const html = await page.content();
 
   const regex =
     /(\d{1,2})\s*Zimmer.*?(\d{2,3}[.,]\d{0,2})\s*m².*?(\d{3,4}[.,]\d{0,2})\s*€/gms;
 
+  const list = [];
   let m;
 
   while ((m = regex.exec(html)) !== null) {
-    const rooms = parseFloat(m[1]);
-    const size = m[2];
-    const rent = parseFloat(m[3].replace(',', '.'));
-
-    if (rent > CONFIG.maxRent) continue;
-    if (rooms < CONFIG.rooms) continue;
-
     list.push({
       id: m[0],
-      rooms,
-      size,
-      rent,
+      rooms: m[1],
+      size: m[2],
+      rent: m[3],
     });
   }
+
+  log('FOUND:', list.length);
 
   return list;
 }
 
 // ================= RUN =================
 
-let first = true;
-
 async function run() {
+  let page;
+
   try {
-    await login();
+    const b = await getBrowser();
+    const ctx = await b.newContext({
+      userAgent:
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+    });
 
-    const html = await fetchPage(CONFIG.finderUrl);
+    page = await ctx.newPage();
 
-    if (!html || html.length < 1000) {
-      throw new Error('Empty HTML received (blocked or redirect)');
-    }
+    await login(page);
 
-    const apartments = parse(html);
+    const apartments = await scrape(page);
 
-    log('FOUND:', apartments.length);
-
-    if (first) {
-      first = false;
-      await tgSend(`🤖 Bot started\nFound: ${apartments.length}`);
-      return;
-    }
-
-    if (apartments.length === 0) {
-      await tgSend('⚠️ No apartments found (maybe site structure changed)');
-      return;
-    }
-
-    const msg =
-      `🏠 Apartments found: ${apartments.length}\n\n` +
-      apartments
-        .slice(0, 5)
-        .map(a => `${a.rooms} rooms | ${a.size} m² | ${a.rent} €`)
-        .join('\n');
-
-    await tgSend(msg);
+    await tgSend(`🏠 Found: ${apartments.length}`);
 
   } catch (e) {
     log('ERROR:', e.message);
     await tgSend(`⚠️ ERROR:\n${e.message}`);
+  } finally {
+    if (page) await page.close();
   }
 }
 
 // ================= START =================
 
 (async () => {
-  log('BOT STARTED (NO BROWSER MODE)');
-
-  if (!CONFIG.login || !CONFIG.password) {
-    log('MISSING CREDENTIALS');
-    return;
-  }
-
+  log('BOT STARTED (STEALTH MODE)');
   await run();
-  setInterval(run, CONFIG.intervalMs);
 })();
