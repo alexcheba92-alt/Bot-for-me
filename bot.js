@@ -1,96 +1,4 @@
-const axios = require('axios');
-const { chromium, devices } = require('playwright');
-const fs = require('fs');
-const path = require('path');
-
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-const INBERLIN_EMAIL = process.env.INBERLIN_EMAIL;
-const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD;
-
-const OUT = path.resolve('./output');
-if (!fs.existsSync(OUT)) fs.mkdirSync(OUT, { recursive: true });
-
-async function sendTelegram(text) {
-  try {
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      chat_id: TELEGRAM_CHAT_ID,
-      text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true
-    }, { timeout: 20000 });
-  } catch (e) {
-    console.error('TG error:', e.message);
-  }
-}
-
-async function acceptCookies(page) {
-  for (const sel of [
-    'button:has-text("Alle akzeptieren")',
-    '#uc-btn-accept-banner',
-    'button:has-text("Accept all")',
-    'button:has-text("Akzeptieren")'
-  ]) {
-    try {
-      const loc = page.locator(sel).first();
-      if (await loc.count()) {
-        await loc.click({ timeout: 3000 });
-        return;
-      }
-    } catch {}
-  }
-}
-
-async function login(page) {
-  await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForLoadState('networkidle').catch(() => {});
-  await acceptCookies(page);
-
-  await page.locator('input[type="email"], input[name="email"]').first().fill(INBERLIN_EMAIL);
-  await page.locator('input[type="password"], input[name="password"]').first().fill(INBERLIN_PASSWORD);
-
-  await Promise.allSettled([
-    page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
-    page.locator('button[type="submit"], input[type="submit"]').first().click()
-  ]);
-
-  await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(2000);
-}
-
-async function openFinder(page) {
-  const apiHits = [];
-  page.on('response', async (resp) => {
-    const url = resp.url();
-    const ct = (resp.headers()['content-type'] || '').toLowerCase();
-    if (resp.request().resourceType() === 'xhr' || resp.request().resourceType() === 'fetch') {
-      apiHits.push({ url, status: resp.status(), ct });
-      console.log('XHR:', resp.status(), ct, url);
-
-      if (ct.includes('application/json')) {
-        try {
-          const txt = await resp.text();
-          fs.writeFileSync(path.join(OUT, 'last_json.txt'), txt);
-        } catch {}
-      }
-    }
-  });
-
-  await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', {
-    waitUntil: 'domcontentloaded',
-    timeout: 60000
-  });
-
-  await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(5000);
-
-  fs.writeFileSync(path.join(OUT, 'api_hits.json'), JSON.stringify(apiHits, null, 2));
-  fs.writeFileSync(path.join(OUT, 'finder.html'), await page.content());
-  fs.writeFileSync(path.join(OUT, 'finder.txt'), await page.locator('body').innerText().catch(() => ''));
-
-  await page.screenshot({ path: path.join(OUT, 'finder.png'), fullPage: true }).catch(() => {});
-}
-
+// Замени функцию main() на эту версию:
 async function main() {
   const browser = await chromium.launch({
     headless: true,
@@ -106,24 +14,86 @@ async function main() {
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
 
+  const responses = [];
+  page.on('response', async (resp) => {
+    const req = resp.request();
+    const url = resp.url();
+    const ct = (resp.headers()['content-type'] || '').toLowerCase();
+    const item = {
+      status: resp.status(),
+      type: req.resourceType(),
+      method: req.method(),
+      url,
+      ct
+    };
+    responses.push(item);
+    if (req.resourceType() === 'xhr' || req.resourceType() === 'fetch') {
+      logLine('XHR', resp.status(), req.method(), ct, url);
+      if (ct.includes('application/json')) {
+        try {
+          const txt = await resp.text();
+          fs.writeFileSync(path.join(OUT, 'last_json.txt'), txt);
+        } catch (e) {
+          logLine('json read failed', e.message);
+        }
+      }
+    }
+  });
+
+  page.on('requestfailed', req => {
+    logLine('REQ FAIL', req.resourceType(), req.method(), req.url(), req.failure()?.errorText || '');
+  });
+
   try {
-    await sendTelegram('Старт диагностики API и списка квартир.');
+    await sendTelegram('Стартую жёсткую диагностику...');
     await login(page);
-    await openFinder(page);
 
-    const body = await page.locator('body').innerText().catch(() => '');
-    const match = body.match(/(\d+)\s+Wohnungen|(\d+)\s+Angeboten|(\d+)\s+Objekten/i);
+    logLine('goto finder');
+    await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.waitForTimeout(6000);
 
-    await sendTelegram(
-      match
-        ? `Страница открылась. Текст счётчика найден: <b>${match[0]}</b>. Смотри output/api_hits.json и finder.*`
-        : 'Страница открылась, но счётчик не найден. Смотри output/api_hits.json и finder.*'
-    );
+    // Сохраняем состояние в файлы
+    await saveState(page, 'finder_state');
+
+    fs.writeFileSync(path.join(OUT, 'responses.json'), JSON.stringify(responses, null, 2));
+    fs.writeFileSync(path.join(OUT, 'cookies.json'), JSON.stringify(await context.cookies(), null, 2));
+    fs.writeFileSync(path.join(OUT, 'storage.json'), JSON.stringify(await context.storageState(), null, 2));
+
+    const text = await page.locator('body').innerText().catch(() => '');
+    const looksLikeCount = text.match(/(\d+)\s+(Wohnungen|Angeboten|Objekten)/i);
+
+    // --- ОТПРАВКА СКРИНШОТА И ЛОГА В ТЕЛЕГРАМ ---
+    const FormData = require('form-data'); // Убедись, что form-data есть в package.json, либо он подтянется из axios
+    
+    // 1. Шлем скриншот экрана
+    const screenshotPath = path.join(OUT, 'finder_state.png');
+    if (fs.existsSync(screenshotPath)) {
+        const formPhoto = new FormData();
+        formPhoto.append('chat_id', TELEGRAM_CHAT_ID);
+        formPhoto.append('photo', fs.createReadStream(screenshotPath));
+        formPhoto.append('caption', looksLikeCount ? `Вижу текст: ${looksLikeCount[0]}` : 'Счётчик текстом не найден. Смотри скриншот.');
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendPhoto`, formPhoto, {
+            headers: formPhoto.getHeaders()
+        }).catch(e => logLine('Ошибка отправки фото в ТГ:', e.message));
+    }
+
+    // 2. Шлем файл логов сети responses.json, чтобы увидеть скрытые API-пути
+    const resJsonPath = path.join(OUT, 'responses.json');
+    if (fs.existsSync(resJsonPath)) {
+        const formDoc = new FormData();
+        formDoc.append('chat_id', TELEGRAM_CHAT_ID);
+        formDoc.append('document', fs.createReadStream(resJsonPath));
+        formDoc.append('caption', 'Лог сетевых запросов (responses.json)');
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendDocument`, formDoc, {
+            headers: formDoc.getHeaders()
+        }).catch(e => logLine('Ошибка отправки документа в ТГ:', e.message));
+    }
+
   } catch (e) {
+    logLine('FATAL', e.stack || e.message);
     await sendTelegram(`Ошибка: ${e.message}`);
   } finally {
     await browser.close();
   }
 }
-
-main().catch(console.error);
