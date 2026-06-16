@@ -6,19 +6,24 @@ const fs = require('fs');
 const path = require('path');
 
 const CONFIG = {
-  login: process.env.IBW_LOGIN || process.env.INBERLIN_EMAIL || '',
-  password: process.env.IBW_PASSWORD || process.env.INBERLIN_PASSWORD || '',
+  login: process.env.INBERLIN_EMAIL || process.env.IBW_LOGIN || '',
+  password: process.env.INBERLIN_PASSWORD || process.env.IBW_PASSWORD || '',
   tgToken: process.env.TELEGRAM_TOKEN || '',
   tgChatId: process.env.TELEGRAM_CHAT_ID || '',
 
-  finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
-  baseUrl: 'https://www.inberlinwohnen.de/',
-
+  maxRent: Number(process.env.MAX_RENT || 600),
+  rooms: Number(process.env.ROOMS || 3),
   intervalMs: Number(process.env.INTERVAL_MS || 5 * 60 * 1000),
+
+  loginUrl: 'https://www.inberlinwohnen.de/',
+  finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
+
   outDir: path.join(__dirname, 'out'),
 };
 
-if (!fs.existsSync(CONFIG.outDir)) fs.mkdirSync(CONFIG.outDir, { recursive: true });
+if (!fs.existsSync(CONFIG.outDir)) {
+  fs.mkdirSync(CONFIG.outDir, { recursive: true });
+}
 
 function log(...a) {
   const line = `[${new Date().toISOString()}] ${a.join(' ')}`;
@@ -26,6 +31,7 @@ function log(...a) {
   fs.appendFileSync(path.join(CONFIG.outDir, 'bot.log'), line + '\n');
 }
 
+// ---------------- TELEGRAM ----------------
 async function tgSend(text) {
   if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
 
@@ -33,182 +39,231 @@ async function tgSend(text) {
     await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       chat_id: CONFIG.tgChatId,
       text: String(text).slice(0, 3500),
-    });
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    }, { timeout: 20000 });
   } catch (e) {
-    log('TG ERROR:', e.message);
+    log('TG ERROR', e.message);
   }
 }
 
-/**
- * 🔥 ULTRA SAFE LOGIN (FIX TВОЕЙ ОШИБКИ)
- */
-async function login(page) {
-  log('LOGIN...');
+// ---------------- SAFE NAV ----------------
+async function safeGoto(page, url) {
+  log('NAVIGATE:', url);
 
-  await page.goto(CONFIG.baseUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  const res = await page.goto(url, {
+    waitUntil: 'domcontentloaded',
+    timeout: 60000,
+  }).catch(e => {
+    throw new Error('NAV FAIL: ' + e.message);
+  });
+
+  // если сайт отдает "download response"
+  const headers = res?.headers?.() || {};
+  if (headers['content-disposition']) {
+    throw new Error('BLOCKED DOWNLOAD RESPONSE');
+  }
 
   await page.waitForTimeout(3000);
+  return res;
+}
 
-  // закрываем cookie
-  try {
-    await page.locator('button:has-text("Alle akzeptieren"), button:has-text("Akzeptieren")')
-      .first().click({ force: true }).catch(() => {});
-  } catch {}
-
-  // 🔥 НЕ ЖДЁМ password напрямую (он часто НЕ СРАБАТЫВАЕТ)
-  const emailSelectors = [
-    'input[type="email"]',
-    'input[name*="email"]',
-    'input[name*="user"]',
-    'input[type="text"]'
+// ---------------- POPUPS ----------------
+async function closePopups(page) {
+  const btns = [
+    'button:has-text("Alle akzeptieren")',
+    'button:has-text("Akzeptieren")',
+    'button:has-text("Zustimmen")',
+    '#uc-btn-accept-banner',
   ];
 
-  let emailBox = null;
-
-  for (const sel of emailSelectors) {
-    const el = page.locator(sel).first();
+  for (const b of btns) {
+    const el = page.locator(b).first();
     if (await el.count().catch(() => 0)) {
-      emailBox = el;
-      break;
+      try {
+        await el.click({ timeout: 2000 });
+        log('COOKIE CLOSED');
+        await page.waitForTimeout(1500);
+        return;
+      } catch {}
     }
   }
 
-  if (!emailBox) {
-    await page.screenshot({ path: path.join(CONFIG.outDir, 'login_error.png') });
-    throw new Error('Email field not found');
+  // remove overlay fallback
+  await page.evaluate(() => {
+    document.querySelectorAll('div').forEach(d => {
+      const t = (d.innerText || '').toLowerCase();
+      if (t.includes('cookie') || t.includes('privacy')) d.remove();
+    });
+  }).catch(() => {});
+}
+
+// ---------------- LOGIN (ROBUST) ----------------
+async function login(page) {
+  log('LOGIN...');
+
+  await safeGoto(page, CONFIG.loginUrl);
+  await closePopups(page);
+
+  // иногда сайт уже логин-редиректит → пропускаем
+  const body = await page.content();
+  if (body.includes('Wohnungsfinder') || page.url().includes('mein-bereich')) {
+    log('ALREADY LOGGED IN');
+    return;
   }
 
-  await emailBox.fill(CONFIG.login);
+  // ищем поля (очень широкий поиск)
+  const email = page.locator('input[type="email"], input[name*="email"], input[name*="user"], input[name*="log"]').first();
+  const pass = page.locator('input[type="password"]').first();
 
-  // 🔥 PASSWORD FIX — НЕ ЖДЁМ ЖЁСТКО
-  let passBox = page.locator('input[type="password"]').first();
+  const emailVisible = await email.isVisible().catch(() => false);
+  const passVisible = await pass.isVisible().catch(() => false);
 
-  let passFound = await passBox.count().catch(() => 0);
+  if (!emailVisible || !passVisible) {
+    log('LOGIN FORM NOT FOUND → fallback mode');
 
-  if (passFound) {
-    await passBox.fill(CONFIG.password);
-  } else {
-    log('PASSWORD FIELD NOT FOUND → fallback ENTER login');
+    // иногда login через cookie session → просто идем дальше
+    return;
   }
 
-  // submit
-  const btn = page.locator('button[type="submit"], input[type="submit"]').first();
+  await email.fill(CONFIG.login);
+  await pass.fill(CONFIG.password);
 
-  if (await btn.count().catch(() => 0)) {
-    await btn.click({ force: true }).catch(() => {});
+  const submit = page.locator('button[type="submit"], input[type="submit"], button:has-text("Login"), button:has-text("Anmelden")').first();
+
+  if (await submit.count().catch(() => 0)) {
+    await Promise.allSettled([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+      submit.click(),
+    ]);
   } else {
     await page.keyboard.press('Enter');
   }
 
-  await page.waitForTimeout(7000);
+  await page.waitForTimeout(4000);
 
   log('LOGIN DONE URL:', page.url());
 }
 
-/**
- * 🔎 SCRAPER (простая стабильная версия)
- */
+// ---------------- SCRAPE ----------------
 async function scrape(page) {
-  log('OPEN FINDER...');
+  log('OPEN FINDER');
 
-  await page.goto(CONFIG.finderUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await safeGoto(page, CONFIG.finderUrl);
+  await closePopups(page);
 
   await page.waitForTimeout(5000);
 
-  // try click search
-  const btn = page.locator('button:has-text("Suchen"), button:has-text("Filtern"), button[type="submit"]').first();
-  if (await btn.count().catch(() => 0)) {
-    await btn.click({ force: true }).catch(() => {});
-  }
-
-  await page.waitForTimeout(7000);
+  // ждём JS загрузку (ВАЖНО!)
+  await page.waitForLoadState('networkidle').catch(() => {});
 
   const data = await page.evaluate(() => {
     const out = [];
+    const els = document.querySelectorAll('article, li, div, a');
 
-    document.querySelectorAll('a, div, li, article').forEach(el => {
+    for (const el of els) {
       const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length < 60) continue;
 
-      if (!text || text.length < 60) return;
+      const hasRooms = /\d+\s*Zimmer/i.test(text);
+      const hasPrice = /\d+\s*€/i.test(text);
+      const hasArea = /\d+\s*m²/i.test(text);
 
-      if (/\d+(?:[.,]\d+)?\s*Zimmer/i.test(text) &&
-          /\d{2,4}(?:[.,]\d+)?\s*€/i.test(text)) {
+      if (!hasRooms && !hasPrice && !hasArea) continue;
 
-        const a = el.querySelector('a[href]');
-        out.push({
-          text,
-          href: a ? a.href : null
-        });
-      }
-    });
+      const a = el.querySelector?.('a[href]');
+      const href = a ? a.href : el.href || '';
 
-    return out.slice(0, 40);
-  });
-
-  const parsed = data.map(x => ({
-    rooms: (x.text.match(/(\d+(?:[.,]\d+)?)\s*Zimmer/i) || [])[1],
-    size: (x.text.match(/(\d+(?:[.,]\d+)?)\s*m²/i) || [])[1],
-    rent: (x.text.match(/(\d{2,4}(?:[.,]\d+)?)\s*€/i) || [])[1],
-    href: x.href
-  }));
-
-  log('FOUND:', parsed.length);
-
-  return parsed;
-}
-
-/**
- * MAIN
- */
-let browser;
-
-async function run() {
-  try {
-    if (!browser) {
-      browser = await chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage']
-      });
+      out.push({ text, href });
     }
 
-    const ctx = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari',
-      locale: 'de-DE'
+    return out;
+  });
+
+  log('RAW FOUND:', data.length);
+
+  return data.map(x => {
+    const r = x.text.match(/(\d+(?:[.,]\d+)?)\s*Zimmer/i);
+    const s = x.text.match(/(\d+(?:[.,]\d+)?)\s*m²/i);
+    const p = x.text.match(/(\d+(?:[.,]\d+)?)\s*€/i);
+
+    return {
+      rooms: r ? r[1] : '',
+      size: s ? s[1] : '',
+      rent: p ? p[1] : '',
+      href: x.href,
+      text: x.text.slice(0, 200),
+    };
+  });
+}
+
+// ---------------- RUN ----------------
+let running = false;
+
+async function run() {
+  if (running) return;
+  running = true;
+
+  let browser, page;
+
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage'],
     });
 
-    const page = await ctx.newPage();
+    const ctx = await browser.newContext({
+      locale: 'de-DE',
+      viewport: { width: 1280, height: 800 },
+    });
+
+    page = await ctx.newPage();
 
     await login(page);
 
-    const res = await scrape(page);
+    const list = await scrape(page);
 
-    if (!res.length) {
+    const filtered = list.filter(a => {
+      const r = parseFloat(a.rent || 0);
+      const rm = parseFloat(a.rooms || 0);
+      return (!r || r <= CONFIG.maxRent) && (!rm || rm >= CONFIG.rooms);
+    });
+
+    if (!filtered.length) {
       await tgSend('⚠️ No apartments found (site changed or blocked)');
+      log('EMPTY RESULT');
       return;
     }
 
     const msg =
-      `🏠 Found: ${res.length}\n\n` +
-      res.slice(0, 5).map(a =>
-        `• ${a.rooms || '?'} rooms | ${a.size || '?'} m² | ${a.rent || '?'} €\n${a.href || ''}`
+      `🏠 <b>Found:</b> ${filtered.length}\n\n` +
+      filtered.slice(0, 5).map(a =>
+        `• ${a.rooms} Zimmer | ${a.size} m² | ${a.rent} €\n${a.href}`
       ).join('\n\n');
 
     await tgSend(msg);
+    log('DONE');
 
   } catch (e) {
     log('ERROR:', e.message);
-    await tgSend('⚠️ ERROR: ' + e.message);
+    await tgSend('⚠️ ERROR:\n' + e.message);
+  } finally {
+    try { await page?.close(); } catch {}
+    try { await browser?.close(); } catch {}
+    running = false;
   }
 }
 
+// ---------------- START ----------------
 (async () => {
   log('BOT STARTED');
 
   if (!CONFIG.login || !CONFIG.password) {
-    log('MISSING CREDS');
+    log('MISSING ENV VARS');
     process.exit(1);
   }
 
   await run();
+
   setInterval(run, CONFIG.intervalMs);
 })();
