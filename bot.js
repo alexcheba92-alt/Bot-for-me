@@ -1,6 +1,6 @@
 'use strict';
 
-const { chromium } = require('playwright');
+const { chromium, devices } = require('playwright');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -10,222 +10,231 @@ const CONFIG = {
   password: process.env.INBERLIN_PASSWORD || '',
   tgToken: process.env.TELEGRAM_TOKEN || '',
   tgChatId: process.env.TELEGRAM_CHAT_ID || '',
-  intervalMs: 300000,
+  intervalMs: Number(process.env.INTERVAL_MS || 300000),
 
   loginUrl: 'https://www.inberlinwohnen.de/login/',
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
 
   outDir: path.join(__dirname, 'out'),
+  seenPath: path.join(__dirname, 'out/seen.json'),
+  maxStore: 5000
 };
 
-if (!fs.existsSync(CONFIG.outDir)) {
-  fs.mkdirSync(CONFIG.outDir, { recursive: true });
+if (!fs.existsSync(CONFIG.outDir)) fs.mkdirSync(CONFIG.outDir, { recursive: true });
+
+/* =========================
+   STATE STORE (SAFE)
+========================= */
+let seen = new Set();
+if (fs.existsSync(CONFIG.seenPath)) {
+  try { seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath, 'utf8'))); } catch {}
 }
 
-function log(...a) {
+function saveSeen() {
+  fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
+}
+
+/* =========================
+   LOGGING
+========================= */
+const log = (...a) => {
   const line = `[${new Date().toISOString()}] ${a.join(' ')}`;
   console.log(line);
   fs.appendFileSync(path.join(CONFIG.outDir, 'bot.log'), line + '\n');
-}
+};
 
+/* =========================
+   TELEGRAM
+========================= */
 async function tg(text) {
   if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
-
   try {
     await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       chat_id: CONFIG.tgChatId,
-      text: String(text).slice(0, 3500),
-      parse_mode: 'HTML'
+      text: String(text).slice(0, 3900),
+      parse_mode: 'HTML',
+      disable_web_page_preview: true
     });
   } catch (e) {
-    log('TG ERROR', e.message);
+    log('TG ERROR:', e.message);
   }
 }
 
-/**
- * FIXED NAVIGATION (убирает Download is starting)
- */
-async function gotoSafe(page, url) {
-  log('NAV:', url);
-
-  const res = await page.goto(url, {
-    waitUntil: 'domcontentloaded',
-    timeout: 60000
-  }).catch(e => {
-    throw new Error('NAV FAIL: ' + e.message);
-  });
-
-  if (!res) throw new Error('NO RESPONSE');
-
-  const ct = res.headers()['content-type'] || '';
-
-  if (!ct.includes('text/html')) {
-    const txt = await res.text().catch(() => '');
-    fs.writeFileSync(path.join(CONFIG.outDir, 'blocked.html'), txt);
-    throw new Error('BLOCKED OR NON-HTML RESPONSE: ' + ct);
+/* =========================
+   SAFE TEXT EXTRACTOR
+========================= */
+async function safeText(response) {
+  try {
+    return await response.text();
+  } catch {
+    return null;
   }
-
-  return res;
 }
 
-async function launch() {
-  return chromium.launch({
+/* =========================
+   ID EXTRACTOR (ROBUST)
+========================= */
+function extractIds(text) {
+  const ids = new Set();
+
+  const patterns = [
+    /expose\/(\d{4,})/g,
+    /"wubID"\s*:\s*"?(\d{4,})"?/g,
+    /"id"\s*:\s*"?(\d{4,})"?/g,
+    /id=(\d{4,})/g
+  ];
+
+  for (const p of patterns) {
+    const matches = [...text.matchAll(p)];
+    for (const m of matches) ids.add(m[1]);
+  }
+
+  return [...ids];
+}
+
+/* =========================
+   MAIN RUN
+========================= */
+async function run() {
+  log('🚀 START CYCLE');
+
+  const browser = await chromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled'
+      '--disable-setuid-sandbox'
     ]
   });
-}
 
-async function context(browser) {
-  return browser.newContext({
-    userAgent:
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36',
+  const ctx = await browser.newContext({
+    ...devices['iPhone 13 Pro'],
     locale: 'de-DE',
-    viewport: { width: 1366, height: 768 }
+    timezoneId: 'Europe/Berlin'
   });
-}
 
-async function login(page) {
-  log('LOGIN...');
+  const page = await ctx.newPage();
 
-  await gotoSafe(page, CONFIG.loginUrl);
+  const cycleIds = new Set();
+  let blocked = false;
 
-  const email = page.locator('input[type="email"], input[name*="mail"]').first();
-  const pass = page.locator('input[type="password"]').first();
-
-  if (await email.count() === 0 || await pass.count() === 0) {
-    fs.writeFileSync(path.join(CONFIG.outDir, 'login_fail.html'), await page.content());
-    throw new Error('LOGIN FIELDS NOT FOUND (blocked or changed DOM)');
-  }
-
-  await email.fill(CONFIG.login);
-  await pass.fill(CONFIG.password);
-
-  await Promise.allSettled([
-    page.waitForNavigation({ waitUntil: 'networkidle', timeout: 30000 }),
-    page.click('button[type="submit"], input[type="submit"]').catch(() => {})
-  ]);
-
-  log('LOGIN OK:', page.url());
-}
-
-/**
- * FIXED SCRAPER (WAIT + API + DOM fallback)
- */
-async function scrape(page) {
-  log('OPEN FINDER...');
-
-  let apiData = [];
-
+  /* =========================
+     READ-ONLY SNiffer (SAFE)
+  ========================= */
   page.on('response', async (res) => {
     try {
-      const url = res.url();
+      const status = res.status();
+      if ([403, 429, 503].includes(status)) blocked = true;
+
+      const ct = (res.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('text') && !ct.includes('json') && !ct.includes('html')) return;
+
+      const text = await safeText(res);
+      if (!text) return;
 
       if (
-        url.includes('wohnung') ||
-        url.includes('api') ||
-        url.includes('listing') ||
-        url.includes('search')
-      ) {
-        const json = await res.json().catch(() => null);
-        if (json) apiData.push(json);
-      }
+        text.includes('captcha') ||
+        text.includes('cloudflare') ||
+        text.includes('blocked')
+      ) blocked = true;
+
+      const ids = extractIds(text);
+      for (const id of ids) cycleIds.add(id);
+
     } catch {}
   });
 
-  await gotoSafe(page, CONFIG.finderUrl);
-
-  await page.waitForLoadState('networkidle');
-  await page.waitForTimeout(8000);
-
-  fs.writeFileSync(
-    path.join(CONFIG.outDir, 'finder.html'),
-    await page.content()
-  );
-
-  log('API FOUND:', apiData.length);
-
-  let apartments = [];
-
-  // 🔥 API PARSE
-  for (const d of apiData) {
-    const items =
-      d?.items ||
-      d?.data ||
-      d?.results ||
-      d?.apartments ||
-      [];
-
-    for (const i of items) {
-      apartments.push({
-        rooms: i.rooms || i.zimmer,
-        size: i.size || i.area,
-        rent: i.rent || i.kaltmiete,
-        title: i.title || i.name,
-        href: i.url || i.link
-      });
-    }
-  }
-
-  // 🔥 DOM fallback (если API пустой)
-  if (!apartments.length) {
-    const text = await page.evaluate(() => document.body.innerText);
-
-    const matches = text.match(/\d+\s*Zimmer[\s\S]{0,200}?€/gi) || [];
-
-    apartments = matches.map(m => ({ text: m }));
-  }
-
-  log('FOUND:', apartments.length);
-
-  return apartments;
-}
-
-async function run() {
-  let browser;
-
   try {
-    browser = await launch();
-    const ctx = await context(browser);
-    const page = await ctx.newPage();
+    /* =========================
+       LOGIN
+    ========================= */
+    log('LOGIN...');
+    await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded' });
 
-    await login(page);
+    await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
 
-    const data = await scrape(page);
+    const email = page.locator('input[type="email"], input[name="email"]').first();
+    if (await email.isVisible().catch(() => false)) {
+      await email.fill(CONFIG.login);
+      await page.locator('input[type="password"]').first().fill(CONFIG.password);
 
-    if (!data.length) {
-      await tg('⚠️ No apartments (blocked or API changed)');
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'networkidle' }).catch(() => {}),
+        page.click('button[type="submit"]')
+      ]);
+    }
+
+    /* =========================
+       FINDER
+    ========================= */
+    log('OPEN FINDER...');
+    await page.goto(CONFIG.finderUrl, { waitUntil: 'networkidle' });
+
+    const miete = page.locator('input[name*="miete_bis"]').last();
+
+    if (await miete.isVisible().catch(() => false)) {
+      await miete.fill('600');
+      await page.locator('input[name*="zimmer_von"]').first().fill('3');
+      await page.locator('input[name*="zimmer_bis"]').first().fill('3');
+
+      await page.click('button:has-text("Wohnung suchen"), button[type="submit"]').catch(() => {});
+      await page.waitForTimeout(9000);
+    }
+
+    /* =========================
+       ANALYSIS
+    ========================= */
+    log(`FOUND RAW IDS: ${cycleIds.size}`);
+
+    if (blocked && cycleIds.size === 0) {
+      await tg('⚠️ <b>BLOCK / CAPTCHA detected</b>');
       return;
     }
 
-    await tg(
-      `🏠 <b>Found:</b> ${data.length}\n\n` +
-      data.slice(0, 8).map(d =>
-        d.text
-          ? `• ${d.text}`
-          : `• ${d.rooms || '?'} rooms | ${d.size || '?'} m² | ${d.rent || '?'}€`
-      ).join('\n')
-    );
+    const alerts = [];
+
+    for (const id of cycleIds) {
+      if (!seen.has(id)) {
+        seen.add(id);
+
+        alerts.push(
+          `🏠 <b>New flat detected</b>\n` +
+          `🔗 https://www.inberlinwohnen.de/expose/${id}/`
+        );
+      }
+    }
+
+    if (alerts.length) {
+      saveSeen();
+
+      for (const a of alerts.slice(0, 10)) {
+        await tg(a);
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    } else {
+      log('NO NEW DATA');
+    }
 
   } catch (e) {
     log('ERROR:', e.message);
-    await tg('⚠️ ERROR:\n' + e.message);
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    await browser.close().catch(() => {});
+    log('CYCLE END');
   }
 }
 
+/* =========================
+   LOOP
+========================= */
 (async () => {
   log('BOT STARTED');
 
   if (!CONFIG.login || !CONFIG.password) {
-    log('MISSING ENV');
-    return;
+    log('NO CREDS');
+    process.exit(1);
   }
 
   await run();
+
   setInterval(run, CONFIG.intervalMs);
 })();
