@@ -11,9 +11,9 @@ const CHECK_INTERVAL = 300000;
 const SEEN_FILE = '/tmp/seen.json';
 const SEARCH_URL = 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder?q=eyJpdiI6IkZWejd0ZFlVSEljbWU1Z0hXT0tmMmc9PSIsInZhbHVlIjoia2lIczRQQUt4VWVYOXJ2U0Y5TTlDc2JadDZzTEtRRk1RK3E0QlFkc29ub3NFSk5McWtncHBoOVVRT0txTDNleVVZalMyZ0RFc3dQdHRwQ2kzaVhqdnczTVV3ZWtmT1FoZDRkU09tL0E4QVhTY1ExUEtGZFlkaDFEVkR5RitzVTRpWHBsUmlFMS80SUNsQ25iaEVjR25zNUZNRmVEUkE4aSszNE1kd3hIdVIwSlFuc0ZxaUxFclJPZDVoMTdWR3RpRVp4cmRoZFd1bGxYaUhXVjUxYXV6Rm41amRrazBJRmlEYUpPNmEwZVFsSWFBRkR0b3dpL1MxL2VRWm5MbHczVDNHV25xemV0R3lTalo4SVpoUzJrRk1CTG5vdUdjTldIemFDYkF2OC9NdTU2OFJLbEIvY3NuY2pRbHo2Y01aOW1hQUNGT1NhSy8xV3dEaHdoV3dVeXJVaHBldnRlU0lpRkVuek5SWlpyTHVKMmF6WlA0YXdaUXcvSkFQSldtcWh4ZnJYUWljRDVmdC82a2s4d1htNFpxNkVEWFAwbGNBdjNBSnRENkFFV2k0aXQxbm1YNjZwc1VhREFPb2pLUUpZVCIsIm1hYyI6IjhhZTViZjViMDM2YWNiYWY1YzEwNGIwODQzN2Y0NzZjMGYxNzgxZGRmNTI5OTNiNjg0ZWQ3NDM5NjU2ZTA3MDEiLCJ0YWciOiIifQ%3D%3D';
 
-// Хранилище: Map id -> { href, text }
 let knownApartments = new Map();
 let isFirstRun = true;
+let diagDone = false;
 
 function load() {
     try {
@@ -21,7 +21,6 @@ function load() {
             const data = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
             knownApartments = new Map(data);
             isFirstRun = false;
-            console.log(`Загружено ${knownApartments.size} квартир из базы`);
         }
     } catch (e) {}
 }
@@ -32,14 +31,10 @@ function save() {
 
 async function sendTelegram(text, url = null) {
     const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
-    if (url) {
-        payload.reply_markup = { inline_keyboard: [[{ text: '📋 Открыть и подать заявку', url }]] };
-    }
+    if (url) payload.reply_markup = { inline_keyboard: [[{ text: '📋 Открыть и подать заявку', url }]] };
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload);
-    } catch (e) {
-        console.error('Telegram ошибка:', e.message);
-    }
+    } catch (e) { console.error('TG:', e.message); }
 }
 
 async function getApartments() {
@@ -55,76 +50,101 @@ async function getApartments() {
         // Логин
         await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(2000);
 
         if (await page.isVisible('input[name="email"]')) {
             await page.fill('input[name="email"]', INBERLIN_EMAIL);
             await page.fill('input[name="password"]', INBERLIN_PASSWORD);
             await page.click('button[type="submit"]');
-            await page.waitForTimeout(4000);
+            await page.waitForTimeout(5000);
         }
 
-        // Открываем страницу с твоими фильтрами
-        await page.goto(SEARCH_URL, { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForTimeout(8000);
+        // Проверяем что залогинились
+        const afterLoginUrl = page.url();
+        console.log('URL после логина:', afterLoginUrl);
 
-        // Делаем скриншот для отладки (первые запуски)
-        // await page.screenshot({ path: '/tmp/debug.png' });
+        // Открываем страницу с фильтрами
+        await page.goto(SEARCH_URL, { waitUntil: 'networkidle', timeout: 60000 });
+        console.log('URL после перехода:', page.url());
+
+        // Ждём текст Zimmer до 30 сек
+        try {
+            await page.waitForFunction(() => document.body.innerText.includes('Zimmer'), { timeout: 30000 });
+        } catch(e) {
+            console.log('Zimmer не появился');
+        }
+
+        await page.waitForTimeout(3000);
+
+        // Диагностика — один раз отправляем в TG что видит бот
+        if (!diagDone) {
+            diagDone = true;
+            const currentUrl = page.url();
+            const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 800));
+            const allLinks = await page.evaluate(() =>
+                Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h).slice(0, 20).join('\n')
+            );
+            await sendTelegram(
+                `🔍 <b>Диагностика бота:</b>\n\n` +
+                `<b>URL:</b> ${currentUrl}\n\n` +
+                `<b>Текст страницы:</b>\n${bodyText}\n\n` +
+                `<b>Первые ссылки:</b>\n${allLinks}`
+            );
+        }
 
         // Читаем квартиры
         const apartments = await page.evaluate(() => {
             const results = [];
+            const seen = new Set();
 
-            // Метод 1: ищем строки с текстом "X Zimmer" и ссылками
-            document.querySelectorAll('li').forEach(li => {
-                const text = li.innerText || '';
+            // Все li с Zimmer
+            document.querySelectorAll('li').forEach(el => {
+                const text = el.innerText || '';
                 if (!text.includes('Zimmer') || !text.includes('€')) return;
-
-                const link = li.querySelector('a[href]');
-                let href = link ? link.href : '';
-                if (!href || href.includes('ueber-uns') || href.includes('/unternehmen/')) return;
-
+                const link = el.querySelector('a[href]');
+                const href = link ? link.href : '';
                 const idMatch = href.match(/\/expose\/(\d+)/);
-                const id = idMatch ? idMatch[1] : null;
-                if (!id) return;
-
-                results.push({
-                    id,
-                    href,
-                    text: text.trim().replace(/\s+/g, ' ').substring(0, 200)
-                });
+                const id = idMatch ? idMatch[1] : ('li_' + text.substring(0, 30));
+                if (!seen.has(id)) {
+                    seen.add(id);
+                    results.push({ id, href, text: text.trim().replace(/\s+/g, ' ').substring(0, 200) });
+                }
             });
 
-            // Метод 2: если ничего не нашли через li — ищем напрямую по expose ссылкам
-            if (results.length === 0) {
-                document.querySelectorAll('a[href*="/expose/"]').forEach(a => {
-                    const href = a.href;
-                    const idMatch = href.match(/\/expose\/(\d+)/);
-                    const id = idMatch ? idMatch[1] : null;
-                    if (!id) return;
+            // Все /expose/ ссылки
+            document.querySelectorAll('a[href*="/expose/"]').forEach(a => {
+                const href = a.href;
+                const idMatch = href.match(/\/expose\/(\d+)/);
+                const id = idMatch ? idMatch[1] : null;
+                if (id && !seen.has(id)) {
+                    seen.add(id);
+                    const parent = a.closest('li, article, div') || a;
+                    results.push({ id, href, text: (parent.innerText || '').trim().replace(/\s+/g, ' ').substring(0, 200) });
+                }
+            });
 
-                    // Берём текст из ближайшего родителя
-                    const parent = a.closest('li, div, article') || a;
-                    const text = (parent.innerText || a.innerText || '').trim().replace(/\s+/g, ' ').substring(0, 200);
-
-                    results.push({ id, href, text });
-                });
-            }
+            // Кнопки "+" которые раскрывают квартиры
+            document.querySelectorAll('button, [role="button"]').forEach(btn => {
+                const text = btn.innerText || '';
+                if (text.includes('Zimmer') && text.includes('€')) {
+                    const id = 'btn_' + text.substring(0, 30);
+                    if (!seen.has(id)) {
+                        seen.add(id);
+                        results.push({ id, href: '', text: text.trim().replace(/\s+/g, ' ').substring(0, 200) });
+                    }
+                }
+            });
 
             return results;
         });
 
-        // Дедупликация по id
         const unique = new Map();
-        for (const apt of apartments) {
-            if (!unique.has(apt.id)) unique.set(apt.id, apt);
-        }
-
-        console.log(`Прочитано квартир: ${unique.size}`);
+        for (const apt of apartments) if (!unique.has(apt.id)) unique.set(apt.id, apt);
+        console.log(`Квартир найдено: ${unique.size}`);
         return unique;
 
     } catch (e) {
-        console.error('Ошибка парсинга:', e.message);
+        console.error('Ошибка:', e.message);
         return new Map();
     } finally {
         await browser.close();
@@ -136,44 +156,26 @@ async function check() {
     console.log(`[${now}] Проверка...`);
 
     const current = await getApartments();
-    if (current.size === 0) {
-        console.log('Сайт не вернул квартир, пропускаем');
-        return;
-    }
+    if (current.size === 0) { console.log('0 квартир, пропускаем'); return; }
 
     if (isFirstRun) {
-        // Первый запуск — просто запоминаем всё что есть, молчим
         knownApartments = current;
         isFirstRun = false;
         save();
-        console.log(`Первый запуск: запомнили ${knownApartments.size} квартир, следим за изменениями`);
+        await sendTelegram(`✅ Бот видит <b>${knownApartments.size} квартир</b>. Молчу пока ничего не меняется.`);
         return;
     }
 
-    // Новые квартиры (появились)
     for (const [id, apt] of current) {
         if (!knownApartments.has(id)) {
-            console.log(`НОВАЯ: ${id}`);
-            await sendTelegram(
-                `🏠 <b>Новая квартира!</b>\n\n📍 ${apt.text}`,
-                apt.href
-            );
+            await sendTelegram(`🏠 <b>Новая квартира!</b>\n\n📍 ${apt.text}`, apt.href || SEARCH_URL);
             await new Promise(r => setTimeout(r, 1500));
         }
     }
 
-    // Исчезнувшие квартиры
-    const disappeared = [];
-    for (const [id] of knownApartments) {
-        if (!current.has(id)) disappeared.push(id);
-    }
-    if (disappeared.length > 0) {
-        const prevCount = knownApartments.size;
-        const newCount = current.size;
-        await sendTelegram(
-            `📉 Квартир стало меньше: было <b>${prevCount}</b>, стало <b>${newCount}</b>`
-        );
-    }
+    let gone = 0;
+    for (const [id] of knownApartments) if (!current.has(id)) gone++;
+    if (gone > 0) await sendTelegram(`📉 Было <b>${knownApartments.size}</b>, стало <b>${current.size}</b>`);
 
     knownApartments = current;
     save();
