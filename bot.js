@@ -1,31 +1,25 @@
 'use strict';
 
-const { chromium, devices } = require('playwright');
+const { chromium } = require('playwright');
 const axios = require('axios');
 const fs = require('fs');
-const path = require('path');
 
 const CONFIG = {
-  login: process.env.INBERLIN_EMAIL || '',
-  password: process.env.INBERLIN_PASSWORD || '',
-  tgToken: process.env.TELEGRAM_TOKEN || '',
-  tgChatId: process.env.TELEGRAM_CHAT_ID || '',
-  intervalMs: 300000,
+  login: process.env.INBERLIN_EMAIL,
+  password: process.env.INBERLIN_PASSWORD,
+  tgToken: process.env.TELEGRAM_TOKEN,
+  tgChatId: process.env.TELEGRAM_CHAT_ID,
 
   loginUrl: 'https://www.inberlinwohnen.de/login/',
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
 
-  outDir: path.join(__dirname, 'out'),
-  seenPath: path.join(__dirname, 'out/seen.json')
+  seenPath: './out/seen_links.json',
+  intervalMs: 300000,
+  maxCycleTimeMs: 20000
 };
 
-if (!fs.existsSync(CONFIG.outDir)) {
-  fs.mkdirSync(CONFIG.outDir, { recursive: true });
-}
+if (!fs.existsSync('./out')) fs.mkdirSync('./out');
 
-/* =========================
-   STATE
-========================= */
 let seen = new Set();
 if (fs.existsSync(CONFIG.seenPath)) {
   try {
@@ -33,28 +27,17 @@ if (fs.existsSync(CONFIG.seenPath)) {
   } catch {}
 }
 
-function saveState() {
-  fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
-}
+let isRunning = false;
 
-/* =========================
-   LOG
-========================= */
-const log = (...a) => {
-  const line = `[${new Date().toISOString()}] ${a.join(' ')}`;
-  console.log(line);
-  fs.appendFileSync(path.join(CONFIG.outDir, 'bot.log'), line + '\n');
-};
+const log = (...a) =>
+  console.log(`[${new Date().toISOString()}]`, ...a);
 
-/* =========================
-   TG
-========================= */
 async function tg(text) {
-  if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
+  if (!CONFIG.tgToken) return;
   try {
     await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       chat_id: CONFIG.tgChatId,
-      text: String(text).slice(0, 3900),
+      text,
       parse_mode: 'HTML',
       disable_web_page_preview: true
     });
@@ -63,142 +46,105 @@ async function tg(text) {
   }
 }
 
-/* =========================
-   EXTRACT FROM LIST PAGE
-========================= */
-async function extractFromList(page) {
-  return await page.evaluate(() => {
-    const items = [];
-
-    document.querySelectorAll('a[href*="expose"]').forEach(a => {
-      const parent = a.closest('div, li, article') || a;
-      const text = parent.textContent.replace(/\s+/g, ' ').trim();
-
-      const match = a.href.match(/expose\/(\d+)/);
-      if (!match) return;
-
-      items.push({
-        id: match[1],
-        text: text.slice(0, 200)
-      });
+// validation against fake / dead pages
+async function isValid(url) {
+  try {
+    const res = await axios.get(url, {
+      timeout: 8000,
+      validateStatus: () => true
     });
 
-    return items;
-  });
+    const t = (res.data || '').toString().toLowerCase();
+
+    if (res.status !== 200) return false;
+    if (t.includes('nicht gefunden')) return false;
+    if (t.includes('veraltete adresse')) return false;
+
+    return true;
+  } catch {
+    return false;
+  }
 }
 
-/* =========================
-   MAIN
-========================= */
-async function run() {
-  log('🚀 START CYCLE');
+async function cycle() {
+  if (isRunning) {
+    log('SKIP: previous cycle still running');
+    return;
+  }
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox', '--disable-dev-shm-usage']
-  });
+  isRunning = true;
+  const start = Date.now();
 
-  const ctx = await browser.newContext({
-    ...devices['iPhone 13 Pro'],
-    locale: 'de-DE',
-    timezoneId: 'Europe/Berlin'
-  });
-
-  const page = await ctx.newPage();
+  let browser;
 
   try {
-    /* ================= LOGIN ================= */
-    log('LOGIN...');
-    await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded' });
+    log('START CYCLE');
 
-    await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-dev-shm-usage']
+    });
 
-    const email = page.locator('input[type="email"], input[name="email"]').first();
+    const page = await browser.newPage();
 
-    if (await email.isVisible().catch(() => false)) {
-      await email.fill(CONFIG.login);
-      await page.locator('input[type="password"]').first().fill(CONFIG.password);
+    // LOGIN
+    await page.goto(CONFIG.loginUrl);
+    await page.fill('input[type="email"]', CONFIG.login);
+    await page.fill('input[type="password"]', CONFIG.password);
+    await Promise.all([
+      page.waitForNavigation().catch(() => {}),
+      page.click('button[type="submit"]')
+    ]);
 
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle' }).catch(() => {}),
-        page.click('button[type="submit"]')
-      ]);
-    }
+    // FINDER
+    await page.goto(CONFIG.finderUrl);
 
-    /* ================= FINDER ================= */
-    log('OPEN FINDER...');
-    await page.goto(CONFIG.finderUrl, { waitUntil: 'networkidle' });
+    await page.waitForSelector('a[href*="/expose/"]', { timeout: 20000 });
+    await page.waitForTimeout(4000); // hydration stabilisation
 
-    const miete = page.locator('input[name*="miete_bis"]').last();
+    const links = await page.$$eval('a[href*="/expose/"]', els =>
+      [...new Set(
+        els
+          .filter(e => e.offsetParent !== null)
+          .map(e => e.href)
+      )]
+    );
 
-    if (await miete.isVisible().catch(() => false)) {
-      await miete.fill('600');
-      await page.locator('input[name*="zimmer_von"]').first().fill('3');
-      await page.locator('input[name*="zimmer_bis"]').first().fill('3');
+    log(`FOUND LINKS: ${links.length}`);
 
-      await page.click('button:has-text("Wohnung suchen"), button[type="submit"]').catch(() => {});
-      await page.waitForTimeout(8000);
-    }
+    let newCount = 0;
 
-    /* ================= LIST SOURCE OF TRUTH ================= */
-    log('EXTRACT LIST...');
+    for (const url of links) {
+      if (seen.has(url)) continue;
 
-    const flats = await extractFromList(page);
-
-    log(`FOUND IN LIST: ${flats.length}`);
-
-    if (!flats.length) {
-      log('EMPTY RESULT (LIST)');
-      return;
-    }
-
-    /* ================= FILTER NEW ================= */
-    const alerts = [];
-
-    for (const f of flats) {
-      if (seen.has(f.id)) continue;
-
-      seen.add(f.id);
-
-      alerts.push(
-        `🏠 <b>Neue Wohnung gefunden</b>\n` +
-        `📝 ${f.text}\n` +
-        `🔗 https://www.inberlinwohnen.de/expose/${f.id}/`
-      );
-    }
-
-    if (alerts.length) {
-      saveState();
-
-      for (const a of alerts) {
-        await tg(a);
-        await new Promise(r => setTimeout(r, 1500));
+      const ok = await isValid(url);
+      if (!ok) {
+        log('INVALID:', url);
+        continue;
       }
 
-      log(`SENT: ${alerts.length}`);
-    } else {
-      log('NO NEW ITEMS');
+      seen.add(url);
+      fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
+
+      await tg(`🏠 <b>Neue Wohnung gefunden</b>\n🔗 ${url}`);
+      newCount++;
+    }
+
+    const duration = Date.now() - start;
+    log(`CYCLE DONE | new: ${newCount} | time: ${duration}ms`);
+
+    if (duration > CONFIG.maxCycleTimeMs) {
+      await tg(`⚠️ <b>WARNING</b>\nSlow cycle detected: ${duration}ms`);
     }
 
   } catch (e) {
     log('ERROR:', e.message);
   } finally {
-    await browser.close().catch(() => {});
-    log('CYCLE END');
+    if (browser) await browser.close().catch(() => {});
+    isRunning = false;
   }
 }
 
-/* =========================
-   LOOP
-========================= */
-(async () => {
-  log('BOT STARTED');
-
-  if (!CONFIG.login || !CONFIG.password) {
-    log('NO CREDS');
-    process.exit(1);
-  }
-
-  await run();
-  setInterval(run, CONFIG.intervalMs);
-})();
+// scheduler (safe)
+setInterval(cycle, CONFIG.intervalMs);
+cycle();
