@@ -37,6 +37,59 @@ async function sendTelegram(text, url = null) {
     } catch (e) { console.error('TG:', e.message); }
 }
 
+async function login(page) {
+    console.log('Открываю страницу логина...');
+    await page.goto('https://www.inberlinwohnen.de/login', { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(2000);
+
+    // Закрываем cookie если есть
+    for (const sel of ['#uc-btn-accept-banner', 'button:has-text("Alle akzeptieren")', 'button:has-text("Auswahl erlauben")']) {
+        try {
+            const btn = page.locator(sel).first();
+            if (await btn.isVisible({ timeout: 2000 })) {
+                await btn.click();
+                await page.waitForTimeout(1000);
+                break;
+            }
+        } catch (_) {}
+    }
+
+    // Ждём поля email
+    await page.waitForSelector('input[name="email"]', { timeout: 10000 });
+    console.log('Поле email найдено, вводим данные...');
+
+    // Очищаем и вводим email
+    await page.click('input[name="email"]');
+    await page.keyboard.selectAll();
+    await page.keyboard.type(INBERLIN_EMAIL, { delay: 50 });
+
+    // Очищаем и вводим пароль
+    await page.click('input[name="password"]');
+    await page.keyboard.selectAll();
+    await page.keyboard.type(INBERLIN_PASSWORD, { delay: 50 });
+
+    console.log('Данные введены, нажимаю Enter...');
+
+    // Нажимаем Enter вместо кнопки — надёжнее
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(5000);
+
+    const url = page.url();
+    console.log('URL после логина:', url);
+
+    if (url.includes('/login')) {
+        // Попробуем ещё раз через кнопку
+        console.log('Всё ещё на логине, пробую кнопку...');
+        try {
+            await page.click('button[type="submit"]');
+            await page.waitForTimeout(5000);
+        } catch(e) {}
+        console.log('URL после кнопки:', page.url());
+    }
+
+    return !page.url().includes('/login');
+}
+
 async function getApartments() {
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
     const context = await browser.newContext({
@@ -47,49 +100,37 @@ async function getApartments() {
     const page = await context.newPage();
 
     try {
-        // Логин
-        await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
-        await page.waitForTimeout(2000);
-
-        if (await page.isVisible('input[name="email"]')) {
-            await page.fill('input[name="email"]', INBERLIN_EMAIL);
-            await page.fill('input[name="password"]', INBERLIN_PASSWORD);
-            await page.click('button[type="submit"]');
-            await page.waitForTimeout(5000);
+        const loggedIn = await login(page);
+        
+        if (!loggedIn) {
+            console.log('ОШИБКА: Не удалось войти!');
+            // Диагностика — что на странице?
+            if (!diagDone) {
+                diagDone = true;
+                const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 500));
+                await sendTelegram(`❌ <b>Не могу войти на сайт!</b>\n\nСтраница показывает:\n${bodyText}\n\nПроверь email и пароль в переменных Railway.`);
+            }
+            return new Map();
         }
 
-        // Проверяем что залогинились
-        const afterLoginUrl = page.url();
-        console.log('URL после логина:', afterLoginUrl);
-
-        // Открываем страницу с фильтрами
+        console.log('Успешно вошёл! Открываю страницу с квартирами...');
         await page.goto(SEARCH_URL, { waitUntil: 'networkidle', timeout: 60000 });
-        console.log('URL после перехода:', page.url());
 
-        // Ждём текст Zimmer до 30 сек
+        // Ждём Zimmer на странице
         try {
             await page.waitForFunction(() => document.body.innerText.includes('Zimmer'), { timeout: 30000 });
+            console.log('Квартиры загружены!');
         } catch(e) {
-            console.log('Zimmer не появился');
+            console.log('Zimmer не появился за 30 сек');
         }
 
         await page.waitForTimeout(3000);
 
-        // Диагностика — один раз отправляем в TG что видит бот
+        // Диагностика после успешного входа
         if (!diagDone) {
             diagDone = true;
-            const currentUrl = page.url();
-            const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 800));
-            const allLinks = await page.evaluate(() =>
-                Array.from(document.querySelectorAll('a')).map(a => a.href).filter(h => h).slice(0, 20).join('\n')
-            );
-            await sendTelegram(
-                `🔍 <b>Диагностика бота:</b>\n\n` +
-                `<b>URL:</b> ${currentUrl}\n\n` +
-                `<b>Текст страницы:</b>\n${bodyText}\n\n` +
-                `<b>Первые ссылки:</b>\n${allLinks}`
-            );
+            const bodyText = await page.evaluate(() => document.body.innerText.substring(0, 600));
+            await sendTelegram(`✅ <b>Вход выполнен!</b>\n\nВот что видит бот:\n${bodyText}`);
         }
 
         // Читаем квартиры
@@ -97,21 +138,19 @@ async function getApartments() {
             const results = [];
             const seen = new Set();
 
-            // Все li с Zimmer
             document.querySelectorAll('li').forEach(el => {
                 const text = el.innerText || '';
                 if (!text.includes('Zimmer') || !text.includes('€')) return;
                 const link = el.querySelector('a[href]');
                 const href = link ? link.href : '';
                 const idMatch = href.match(/\/expose\/(\d+)/);
-                const id = idMatch ? idMatch[1] : ('li_' + text.substring(0, 30));
+                const id = idMatch ? idMatch[1] : ('li_' + text.substring(0, 40).replace(/\s/g,''));
                 if (!seen.has(id)) {
                     seen.add(id);
                     results.push({ id, href, text: text.trim().replace(/\s+/g, ' ').substring(0, 200) });
                 }
             });
 
-            // Все /expose/ ссылки
             document.querySelectorAll('a[href*="/expose/"]').forEach(a => {
                 const href = a.href;
                 const idMatch = href.match(/\/expose\/(\d+)/);
@@ -120,18 +159,6 @@ async function getApartments() {
                     seen.add(id);
                     const parent = a.closest('li, article, div') || a;
                     results.push({ id, href, text: (parent.innerText || '').trim().replace(/\s+/g, ' ').substring(0, 200) });
-                }
-            });
-
-            // Кнопки "+" которые раскрывают квартиры
-            document.querySelectorAll('button, [role="button"]').forEach(btn => {
-                const text = btn.innerText || '';
-                if (text.includes('Zimmer') && text.includes('€')) {
-                    const id = 'btn_' + text.substring(0, 30);
-                    if (!seen.has(id)) {
-                        seen.add(id);
-                        results.push({ id, href: '', text: text.trim().replace(/\s+/g, ' ').substring(0, 200) });
-                    }
                 }
             });
 
@@ -156,7 +183,7 @@ async function check() {
     console.log(`[${now}] Проверка...`);
 
     const current = await getApartments();
-    if (current.size === 0) { console.log('0 квартир, пропускаем'); return; }
+    if (current.size === 0) { console.log('0 квартир'); return; }
 
     if (isFirstRun) {
         knownApartments = current;
