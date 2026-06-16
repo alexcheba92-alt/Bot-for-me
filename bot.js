@@ -10,32 +10,35 @@ const CONFIG = {
   password: process.env.INBERLIN_PASSWORD || '',
   tgToken: process.env.TELEGRAM_TOKEN || '',
   tgChatId: process.env.TELEGRAM_CHAT_ID || '',
-  intervalMs: Number(process.env.INTERVAL_MS || 300000),
+  intervalMs: 300000,
 
   loginUrl: 'https://www.inberlinwohnen.de/login/',
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
 
   outDir: path.join(__dirname, 'out'),
-  seenPath: path.join(__dirname, 'out/seen.json'),
-  maxStore: 5000
+  seenPath: path.join(__dirname, 'out/seen.json')
 };
 
-if (!fs.existsSync(CONFIG.outDir)) fs.mkdirSync(CONFIG.outDir, { recursive: true });
+if (!fs.existsSync(CONFIG.outDir)) {
+  fs.mkdirSync(CONFIG.outDir, { recursive: true });
+}
 
 /* =========================
-   STATE STORE (SAFE)
+   STATE
 ========================= */
 let seen = new Set();
 if (fs.existsSync(CONFIG.seenPath)) {
-  try { seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath, 'utf8'))); } catch {}
+  try {
+    seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath, 'utf8')));
+  } catch {}
 }
 
-function saveSeen() {
+function saveState() {
   fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
 }
 
 /* =========================
-   LOGGING
+   LOG
 ========================= */
 const log = (...a) => {
   const line = `[${new Date().toISOString()}] ${a.join(' ')}`;
@@ -44,7 +47,7 @@ const log = (...a) => {
 };
 
 /* =========================
-   TELEGRAM
+   TG
 ========================= */
 async function tg(text) {
   if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
@@ -61,50 +64,38 @@ async function tg(text) {
 }
 
 /* =========================
-   SAFE TEXT EXTRACTOR
+   EXTRACT FROM LIST PAGE
 ========================= */
-async function safeText(response) {
-  try {
-    return await response.text();
-  } catch {
-    return null;
-  }
+async function extractFromList(page) {
+  return await page.evaluate(() => {
+    const items = [];
+
+    document.querySelectorAll('a[href*="expose"]').forEach(a => {
+      const parent = a.closest('div, li, article') || a;
+      const text = parent.textContent.replace(/\s+/g, ' ').trim();
+
+      const match = a.href.match(/expose\/(\d+)/);
+      if (!match) return;
+
+      items.push({
+        id: match[1],
+        text: text.slice(0, 200)
+      });
+    });
+
+    return items;
+  });
 }
 
 /* =========================
-   ID EXTRACTOR (ROBUST)
-========================= */
-function extractIds(text) {
-  const ids = new Set();
-
-  const patterns = [
-    /expose\/(\d{4,})/g,
-    /"wubID"\s*:\s*"?(\d{4,})"?/g,
-    /"id"\s*:\s*"?(\d{4,})"?/g,
-    /id=(\d{4,})/g
-  ];
-
-  for (const p of patterns) {
-    const matches = [...text.matchAll(p)];
-    for (const m of matches) ids.add(m[1]);
-  }
-
-  return [...ids];
-}
-
-/* =========================
-   MAIN RUN
+   MAIN
 ========================= */
 async function run() {
   log('🚀 START CYCLE');
 
   const browser = await chromium.launch({
     headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-setuid-sandbox'
-    ]
+    args: ['--no-sandbox', '--disable-dev-shm-usage']
   });
 
   const ctx = await browser.newContext({
@@ -115,45 +106,15 @@ async function run() {
 
   const page = await ctx.newPage();
 
-  const cycleIds = new Set();
-  let blocked = false;
-
-  /* =========================
-     READ-ONLY SNiffer (SAFE)
-  ========================= */
-  page.on('response', async (res) => {
-    try {
-      const status = res.status();
-      if ([403, 429, 503].includes(status)) blocked = true;
-
-      const ct = (res.headers()['content-type'] || '').toLowerCase();
-      if (!ct.includes('text') && !ct.includes('json') && !ct.includes('html')) return;
-
-      const text = await safeText(res);
-      if (!text) return;
-
-      if (
-        text.includes('captcha') ||
-        text.includes('cloudflare') ||
-        text.includes('blocked')
-      ) blocked = true;
-
-      const ids = extractIds(text);
-      for (const id of ids) cycleIds.add(id);
-
-    } catch {}
-  });
-
   try {
-    /* =========================
-       LOGIN
-    ========================= */
+    /* ================= LOGIN ================= */
     log('LOGIN...');
     await page.goto(CONFIG.loginUrl, { waitUntil: 'domcontentloaded' });
 
     await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
 
     const email = page.locator('input[type="email"], input[name="email"]').first();
+
     if (await email.isVisible().catch(() => false)) {
       await email.fill(CONFIG.login);
       await page.locator('input[type="password"]').first().fill(CONFIG.password);
@@ -164,9 +125,7 @@ async function run() {
       ]);
     }
 
-    /* =========================
-       FINDER
-    ========================= */
+    /* ================= FINDER ================= */
     log('OPEN FINDER...');
     await page.goto(CONFIG.finderUrl, { waitUntil: 'networkidle' });
 
@@ -178,41 +137,47 @@ async function run() {
       await page.locator('input[name*="zimmer_bis"]').first().fill('3');
 
       await page.click('button:has-text("Wohnung suchen"), button[type="submit"]').catch(() => {});
-      await page.waitForTimeout(9000);
+      await page.waitForTimeout(8000);
     }
 
-    /* =========================
-       ANALYSIS
-    ========================= */
-    log(`FOUND RAW IDS: ${cycleIds.size}`);
+    /* ================= LIST SOURCE OF TRUTH ================= */
+    log('EXTRACT LIST...');
 
-    if (blocked && cycleIds.size === 0) {
-      await tg('⚠️ <b>BLOCK / CAPTCHA detected</b>');
+    const flats = await extractFromList(page);
+
+    log(`FOUND IN LIST: ${flats.length}`);
+
+    if (!flats.length) {
+      log('EMPTY RESULT (LIST)');
       return;
     }
 
+    /* ================= FILTER NEW ================= */
     const alerts = [];
 
-    for (const id of cycleIds) {
-      if (!seen.has(id)) {
-        seen.add(id);
+    for (const f of flats) {
+      if (seen.has(f.id)) continue;
 
-        alerts.push(
-          `🏠 <b>New flat detected</b>\n` +
-          `🔗 https://www.inberlinwohnen.de/expose/${id}/`
-        );
-      }
+      seen.add(f.id);
+
+      alerts.push(
+        `🏠 <b>Neue Wohnung gefunden</b>\n` +
+        `📝 ${f.text}\n` +
+        `🔗 https://www.inberlinwohnen.de/expose/${f.id}/`
+      );
     }
 
     if (alerts.length) {
-      saveSeen();
+      saveState();
 
-      for (const a of alerts.slice(0, 10)) {
+      for (const a of alerts) {
         await tg(a);
         await new Promise(r => setTimeout(r, 1500));
       }
+
+      log(`SENT: ${alerts.length}`);
     } else {
-      log('NO NEW DATA');
+      log('NO NEW ITEMS');
     }
 
   } catch (e) {
@@ -235,6 +200,5 @@ async function run() {
   }
 
   await run();
-
   setInterval(run, CONFIG.intervalMs);
 })();
