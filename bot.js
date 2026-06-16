@@ -14,8 +14,7 @@ const CONFIG = {
   finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
 
   seenPath: './out/seen_links.json',
-  intervalMs: 300000,
-  maxCycleTimeMs: 20000
+  intervalMs: 300000
 };
 
 if (!fs.existsSync('./out')) fs.mkdirSync('./out');
@@ -23,42 +22,86 @@ if (!fs.existsSync('./out')) fs.mkdirSync('./out');
 let seen = new Set();
 if (fs.existsSync(CONFIG.seenPath)) {
   try {
-    seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath, 'utf8')));
+    seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath)));
   } catch {}
 }
 
-let isRunning = false;
+let running = false;
 
-const log = (...a) =>
-  console.log(`[${new Date().toISOString()}]`, ...a);
+const log = (...a) => console.log(`[${new Date().toISOString()}]`, ...a);
 
 async function tg(text) {
-  if (!CONFIG.tgToken) return;
   try {
     await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
       chat_id: CONFIG.tgChatId,
       text,
-      parse_mode: 'HTML',
-      disable_web_page_preview: true
+      parse_mode: 'HTML'
     });
   } catch (e) {
     log('TG ERROR:', e.message);
   }
 }
 
-// validation against fake / dead pages
-async function isValid(url) {
+async function safeGoto(page, url) {
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  } catch (e) {
+    log('NAV WARN:', e.message);
+  }
+}
+
+async function login(page) {
+  log('LOGIN...');
+
+  await safeGoto(page, CONFIG.loginUrl);
+
+  const email = page.locator('input[type="email"], input[name="email"]').first();
+  const pass = page.locator('input[type="password"]').first();
+
+  await email.waitFor({ state: 'visible', timeout: 20000 });
+
+  await email.fill(CONFIG.login);
+  await pass.fill(CONFIG.password);
+
+  await page.click('button[type="submit"]').catch(() => {});
+
+  // ждём не навигацию, а факт появления внутреннего контента
+  await page.waitForSelector('a[href*="/expose/"], body', { timeout: 30000 });
+
+  log('LOGIN DONE');
+}
+
+async function extractLinks(page) {
+  await safeGoto(page, CONFIG.finderUrl);
+
+  // ждём именно данные, не сеть
+  await page.waitForSelector('a[href*="/expose/"]', { timeout: 30000 });
+
+  await page.waitForTimeout(5000);
+
+  const links = await page.$$eval('a[href*="/expose/"]', els =>
+    [...new Set(
+      els
+        .filter(e => e.offsetParent !== null)
+        .map(e => e.href)
+    )]
+  );
+
+  return links;
+}
+
+async function validate(url) {
   try {
     const res = await axios.get(url, {
       timeout: 8000,
       validateStatus: () => true
     });
 
-    const t = (res.data || '').toString().toLowerCase();
+    const text = (res.data || '').toString().toLowerCase();
 
     if (res.status !== 200) return false;
-    if (t.includes('nicht gefunden')) return false;
-    if (t.includes('veraltete adresse')) return false;
+    if (text.includes('nicht gefunden')) return false;
+    if (text.includes('veraltete adresse')) return false;
 
     return true;
   } catch {
@@ -66,85 +109,46 @@ async function isValid(url) {
   }
 }
 
-async function cycle() {
-  if (isRunning) {
-    log('SKIP: previous cycle still running');
-    return;
-  }
+async function run() {
+  if (running) return;
+  running = true;
 
-  isRunning = true;
-  const start = Date.now();
+  log('START CYCLE');
 
-  let browser;
+  const browser = await chromium.launch({
+    headless: true
+  });
+
+  const page = await browser.newPage();
 
   try {
-    log('START CYCLE');
+    await login(page);
 
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox', '--disable-dev-shm-usage']
-    });
+    const links = await extractLinks(page);
 
-    const page = await browser.newPage();
-
-    // LOGIN
-    await page.goto(CONFIG.loginUrl);
-    await page.fill('input[type="email"]', CONFIG.login);
-    await page.fill('input[type="password"]', CONFIG.password);
-    await Promise.all([
-      page.waitForNavigation().catch(() => {}),
-      page.click('button[type="submit"]')
-    ]);
-
-    // FINDER
-    await page.goto(CONFIG.finderUrl);
-
-    await page.waitForSelector('a[href*="/expose/"]', { timeout: 20000 });
-    await page.waitForTimeout(4000); // hydration stabilisation
-
-    const links = await page.$$eval('a[href*="/expose/"]', els =>
-      [...new Set(
-        els
-          .filter(e => e.offsetParent !== null)
-          .map(e => e.href)
-      )]
-    );
-
-    log(`FOUND LINKS: ${links.length}`);
-
-    let newCount = 0;
+    log('FOUND LINKS:', links.length);
 
     for (const url of links) {
       if (seen.has(url)) continue;
 
-      const ok = await isValid(url);
-      if (!ok) {
-        log('INVALID:', url);
-        continue;
-      }
+      const ok = await validate(url);
+      if (!ok) continue;
 
       seen.add(url);
       fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
 
-      await tg(`🏠 <b>Neue Wohnung gefunden</b>\n🔗 ${url}`);
-      newCount++;
-    }
-
-    const duration = Date.now() - start;
-    log(`CYCLE DONE | new: ${newCount} | time: ${duration}ms`);
-
-    if (duration > CONFIG.maxCycleTimeMs) {
-      await tg(`⚠️ <b>WARNING</b>\nSlow cycle detected: ${duration}ms`);
+      await tg(`🏠 New flat\n🔗 ${url}`);
+      log('SENT:', url);
     }
 
   } catch (e) {
-    log('ERROR:', e.message);
+    log('CYCLE ERROR:', e.message);
   } finally {
-    if (browser) await browser.close().catch(() => {});
-    isRunning = false;
+    await browser.close().catch(() => {});
+    running = false;
+    log('CYCLE END');
   }
 }
 
-// scheduler (safe)
-setInterval(cycle, CONFIG.intervalMs);
-cycle();
+run();
+setInterval(run, CONFIG.intervalMs);
