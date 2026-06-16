@@ -6,46 +6,37 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const INBERLIN_EMAIL = process.env.INBERLIN_EMAIL;
 const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD;
-const CHECK_INTERVAL = 300000; // 5 минут
+const CHECK_INTERVAL = 300000;
 
 const SEEN_FILE = './seen_apartments.json';
 let seen = new Set();
 
-// Загружаем старые квартиры из файла, чтобы не спамить одним и тем же при перезапусках Railway
 if (fs.existsSync(SEEN_FILE)) {
     try {
         const data = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
         seen = new Set(data);
-        console.log(`[База] Загружено из памяти старых ID: ${seen.size}`);
-    } catch (e) {
-        console.log('[База] Ошибка чтения памяти, создаем чистую.');
-    }
+        console.log(`[База] Загружено старых ID: ${seen.size}`);
+    } catch (e) {}
 }
 
 function saveCache() {
-    try {
-        fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen]), 'utf8');
-    } catch (e) {
-        console.error('[База] Ошибка сохранения:', e.message);
-    }
+    try { fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen]), 'utf8'); } catch (e) {}
 }
 
 async function sendTelegram(text, url = null) {
     const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
-    if (url) {
-        payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
-    }
+    if (url) payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload);
         console.log('✅ Сообщение отправлено в Telegram');
     } catch (e) {
-        console.error('❌ Ошибка Telegram (Проверь ID чата и Токен!):', e.message);
+        console.error('❌ Ошибка Telegram:', e.message);
     }
 }
 
 async function checkApartments() {
     const now = new Date().toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' });
-    console.log(`[${now}] Запуск проверки (3 комнаты ≤ 600€ Kaltmiete)...`);
+    console.log(`[${now}] Запуск проверки...`);
 
     const browser = await chromium.launch({
         headless: true,
@@ -61,38 +52,30 @@ async function checkApartments() {
     const page = await context.newPage();
 
     try {
-        // Авторизация
+        // 1. Логин
         console.log('Авторизация...');
         await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 45000 });
         await page.waitForTimeout(2000);
 
-        // Кликаем куки
         await page.locator('button:has-text("Alle akzeptieren"), #uc-btn-accept-banner').click().catch(() => {});
 
-        if (await page.isVisible('input[name="email"]', { timeout: 10000 })) {
+        if (await page.isVisible('input[name="email"]')) {
             await page.fill('input[name="email"]', INBERLIN_EMAIL);
             await page.fill('input[name="password"]', INBERLIN_PASSWORD);
             await page.click('button[type="submit"]');
             await page.waitForTimeout(6000);
         }
 
-        // Переход на поисковик
+        // 2. Поисковик
         console.log('Открываю Wohnungsfinder...');
-        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { 
-            waitUntil: 'networkidle', 
-            timeout: 60000 
-        });
+        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 60000 });
         await page.waitForTimeout(4000);
 
-        // === ФИЛЬТРЫ ===
+        // 3. Выставляем фильтры
         console.log('Применяю фильтры...');
-        const mieteSelectors = ['input[name*="miete_bis"]', 'input[id*="miete_bis"]', 'input[placeholder*="Kaltmiete"]'];
-        for (const sel of mieteSelectors) {
-            const input = page.locator(sel).last();
-            if (await input.isVisible({ timeout: 4000 })) {
-                await input.fill('600');
-                break;
-            }
+        const mieteInput = page.locator('input[name*="miete_bis"], input[id*="miete_bis"], input[placeholder*="Kaltmiete"]').last();
+        if (await mieteInput.isVisible({ timeout: 4000 })) {
+            await mieteInput.fill('600');
         }
 
         const zimmerSelectors = ['input[name*="zimmer_von"]', 'input[name*="zimmer_bis"]'];
@@ -101,26 +84,41 @@ async function checkApartments() {
             if (await input.isVisible({ timeout: 4000 })) await input.fill('3');
         }
 
-        const searchBtn = page.locator('button:has-text("Wohnung suchen"), button[type="submit"]');
-        await searchBtn.click().catch(() => {});
+        await page.locator('button:has-text("Wohnung suchen"), button[type="submit"]').click().catch(() => {});
+        await page.waitForTimeout(6000);
 
-        await page.waitForTimeout(8000);
+        // 4. ЖЕСТКОЕ ПЕРЕКЛЮЧЕНИЕ НА РЕЖИМ СПИСКА (Listview)
+        // Ищем кнопку по классам и атрибутам и кликаем, чтобы убрать карту и показать карточки
+        console.log('Переключаюсь с карты на список квартир...');
+        const listButton = page.locator('.aria-icon-list, [class*="list"], button:has-text("Liste"), .list-view-button').first();
+        if (await listButton.isVisible({ timeout: 3000 })) {
+            await listButton.click();
+            await page.waitForTimeout(3000);
+        } else {
+            // Альтернативный клик по иконке списка, если классы другие
+            await page.click('ul.view-modes li:nth-child(2), .view-mode-list').catch(() => {});
+            await page.waitForTimeout(2000);
+        }
 
         // === ОБРАБОТКА КАПЧИ ===
-        const captchaVisible = await page.locator('iframe[src*="captcha"], div[id*="captcha"], .g-recaptcha, #challenge-form').isVisible({ timeout: 3000 }).catch(() => false);
+        const captchaVisible = await page.locator('iframe[src*="captcha"], #challenge-form').isVisible({ timeout: 2000 }).catch(() => false);
         if (captchaVisible) {
-            console.log('⚠️ Обнаружена капча! Пропускаем круг.');
+            console.log('⚠️ Капча на странице. Пропускаем.');
             return;
         }
 
-        // Парсинг результатов
+        // 5. Парсинг
+        console.log('Парсим карточки товаров...');
         const apartments = await page.evaluate(() => {
             const results = [];
-            document.querySelectorAll('a').forEach(a => {
+            // Собираем вообще все ссылки на странице, содержащие /expose/
+            document.querySelectorAll('a[href*="/expose/"]').forEach(a => {
                 const href = a.href ? a.href.trim() : '';
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ');
-                if (href && (href.includes('/expose/') || href.includes('detail'))) {
-                    results.push({ href, text: text.substring(0, 120) || 'Квартира' });
+                // Берем текст самой ссылки или текст родительского блока карточки
+                const parent = a.closest('div, li, article') || a;
+                const text = (parent.textContent || a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
+                if (href) {
+                    results.push({ href, text });
                 }
             });
             return results;
@@ -134,39 +132,34 @@ async function checkApartments() {
             const match = apt.href.match(/expose\/([^/?#]+)/) || apt.href.match(/(\d{5,}-?\d*)/);
             const id = match ? match[1] : apt.href;
 
-            // ЕСЛИ ЭТОГО ID НЕТ В БАЗЕ — СРАЗУ ШЛЕМ В ТЕЛЕГРАМ
             if (!seen.has(id)) {
                 seen.add(id);
                 newFound = true;
                 
                 const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
                 await sendTelegram(
-                    `🏠 <b>Найдена квартира (3 Zimmer ≤ 600€)!</b>\n⏰ Время: ${time}\n📝 Описание: ${apt.text}...`,
+                    `🏠 <b>Найдена квартира!</b>\n⏰ Время: ${time}\n📝 Данные: ${apt.text}...`,
                     apt.href
                 );
-                await new Promise(r => setTimeout(r, 2000)); // Пауза, чтобы ТГ не забанил за спам
+                await new Promise(r => setTimeout(r, 2000));
             }
         }
 
         if (newFound) {
             saveCache();
         } else {
-            console.log('Новых квартир с момента последней проверки нет.');
+            console.log('Новых объектов с момента последней проверки не появилось.');
         }
 
     } catch (e) {
-        console.error('❌ Ошибка в цикле:', e.message);
+        console.error('❌ Ошибка:', e.message);
     } finally {
         await browser.close();
     }
 }
 
 async function main() {
-    console.log('🤖 Бот стартует (Браузерный режим)...');
-    
-    // Сразу проверяем, доходят ли вообще сообщения до твоего ТГ
-    await sendTelegram('🚀 <b>Бот запущен на Railway!</b>\nПроверяю связь. Если ты видишь это сообщение, значит ТГ-канал подключен правильно. Начинаю первый сбор квартир...');
-    
+    console.log('🤖 Бот перезапущен с фиксом отображения списка...');
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
 }
