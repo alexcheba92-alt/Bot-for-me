@@ -1,4 +1,4 @@
-const { chromium, devices } = require('playwright');
+[17.06.2026 17:08] Alexey: const { chromium, devices } = require('playwright');
 const axios = require('axios');
 const fs = require('fs');
 
@@ -59,13 +59,18 @@ async function checkApartments() {
             const results = [];
             document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 150);
-                if (href.length > 50 && 
-                    (href.includes('/expose/') || 
-                     href.includes('howoge') || href.includes('gewobag') || 
-                     href.includes('degewo') || href.includes('stadtundland') || 
-                     href.includes('wohnung') || href.includes('immobilien'))) {
-                    results.push({ href, text });
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
+                
+                // Строгий фильтр: только реальные квартиры
+                if (href.includes('/expose/') || 
+                    (href.includes('howoge.de') && href.includes('/')) || 
+                    (href.includes('gewobag.de') && href.includes('/')) || 
+                    (href.includes('degewo.de') && href.includes('/')) || 
+                    (href.includes('stadtundland.de') && href.includes('/'))) {
+                    
+                    if (!href.includes('/unternehmen/') && !href.includes('ueber-uns') && !href.includes('impressum')) {
+                        results.push({ href, text });
+                    }
                 }
             });
             return results;
@@ -74,24 +79,29 @@ async function checkApartments() {
         console.log(`Найдено ссылок: ${apartments.length}`);
 
         let newCount = 0;
+        const isFirst = seen.size === 0;
 
         for (const apt of apartments) {
             if (!seen.has(apt.href)) {
                 seen.add(apt.href);
                 newCount++;
 
-                const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
-                await sendTelegram(
-                    `🚨 <b>НОВАЯ КВАРТИРА!</b> 🏠\n\n` +
-                    `🕒 ${time}\n` +
-                    `🔗 ${apt.href}\n\n` +
-                    `📝 ${apt.text}...`,
-                    apt.href
-                );
+                if (!isFirst) {
+                    const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
+                    await sendTelegram(
+                        🚨 <b>НОВАЯ КВАРТИРА!</b> 🏠\n\n +
+                        🕒 ${time}\n +
+                        🔗 ${apt.href}\n\n +
+                        📝 ${apt.text}...,
+                        apt.href
+                    );
+                }
             }
         }
 
-        if (newCount > 0) {
+        if (isFirst) {
+[17.06.2026 17:08] Alexey: await sendTelegram(`🤖 Бот запущен!\nНайдено на старте: ${seen.size} квартир`);
+        } else if (newCount > 0) {
             console.log(`✅ Отправлено ${newCount} новых квартир`);
         } else {
             console.log('Новых квартир нет');
@@ -109,7 +119,7 @@ async function checkApartments() {
 async function main() {
     loadSeen();
     console.log('🤖 Бот запущен');
-    await sendTelegram('🤖 Бот перезапущен. Ищу все квартиры по фильтру.');
+    await sendTelegram('🤖 Бот перезапущен. Пытаюсь ловить все квартиры.');
 
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
