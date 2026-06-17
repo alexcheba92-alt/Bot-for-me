@@ -14,12 +14,9 @@ const CHECK_INTERVAL = 5 * 60 * 1000;
 const STATE_FILE = '/tmp/inberlin_state.json';
 const DEBUG_DIR = '/tmp/inberlin_debug';
 
-let state = {
-  seen: [],
-  firstRun: true
-};
+let state = { seen: [], firstRun: true };
 
-function ensureDirs() {
+function ensureDebugDir() {
   if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 }
 
@@ -58,6 +55,23 @@ function escapeHtml(s = '') {
     .replace(/"/g, '&quot;');
 }
 
+function isBadLink(href) {
+  const h = href.toLowerCase();
+  return (
+    h === 'https://www.inberlinwohnen.de' ||
+    h === 'https://www.inberlinwohnen.de/' ||
+    h.includes('/datenschutz') ||
+    h.includes('/impressum') ||
+    h.includes('/login') ||
+    h.includes('/kontakt') ||
+    h.includes('/wohnungsfinder') ||
+    h.includes('/wohnungstausch') ||
+    h.includes('/wohnungsvergabe') ||
+    h.endsWith('#') ||
+    h.includes('mailto:')
+  );
+}
+
 async function sendTelegram(text, url = null) {
   const payload = {
     chat_id: TELEGRAM_CHAT_ID,
@@ -65,13 +79,11 @@ async function sendTelegram(text, url = null) {
     parse_mode: 'HTML',
     disable_web_page_preview: true
   };
-
   if (url) {
     payload.reply_markup = {
       inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]]
     };
   }
-
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload, {
     timeout: 30000
   });
@@ -100,75 +112,72 @@ async function openFinder(page) {
     waitUntil: 'networkidle',
     timeout: 120000
   });
-  await page.waitForTimeout(5000);
+  await page.waitForTimeout(6000);
 }
 
 async function extractListings(page) {
-  return await page.evaluate(() => {
-    const results = [];
+  return await page.evaluate((isBadLinkFnSource) => {
+    const isBadLink = new Function(`return (${isBadLinkFnSource})`)();
+
+    const textScore = (t) => {
+      let score = 0;
+      if (/€|euro|kaltmiete|warmmiete/i.test(t)) score += 2;
+      if (/zimmer|qm|m²/i.test(t)) score += 2;
+      if (/bezirk|berlin|wohnung|angebot|expose/i.test(t)) score += 1;
+      return score;
+    };
+
+    const out = [];
     const seen = new Set();
 
-    const candidates = Array.from(document.querySelectorAll('a[href], article, li, .card, .result, .listing, .listing-item, .offer, .angebot'));
+    const nodes = Array.from(document.querySelectorAll('article, li, .card, .result, .listing, .listing-item, .offer, .angebot, div'));
+    for (const node of nodes) {
+      const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text || text.length < 20) continue;
+      if (textScore(text) < 3) continue;
 
-    for (const node of candidates) {
-      const root = node.matches && node.matches('a[href]') ? node : node.querySelector?.('a[href]');
-      if (!root) continue;
+      const links = Array.from(node.querySelectorAll('a[href]'));
+      const link = links.find(a => {
+        const href = (a.href || '').trim();
+        if (!href) return false;
+        if (isBadLink(href)) return false;
+        if (!href.includes('inberlinwohnen.de')) return false;
+        return true;
+      });
 
-      const href = root.href ? root.href.trim() : '';
-      if (!href) continue;
+      if (!link) continue;
 
-      const text = (node.innerText || node.textContent || root.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!text) continue;
+      const href = link.href.replace(/\/$/, '').split('?')[0];
+      if (seen.has(href)) continue;
+      seen.add(href);
 
-      if (!href.includes('inberlinwohnen.de')) continue;
-      if (href.includes('/login') || href.includes('/wohnungsfinder/') || href.includes('/wohnungstausch') || href.endsWith('#')) continue;
-
-      const score =
-        (/zimmer|qm|m²|kaltmiete|warmmiete|€|euro|bezirk|berlin/i.test(text) ? 1 : 0) +
-        (/expose|wohnung|angebot|wohnungssuche|wohnungsangebot/i.test(text) ? 1 : 0);
-
-      if (score < 1) continue;
-
-      const key = href.replace(/\/$/, '').split('?')[0];
-      if (seen.has(key)) continue;
-      seen.add(key);
-
-      results.push({
-        href: key,
-        text: text.slice(0, 400)
+      out.push({
+        href,
+        text: text.slice(0, 500)
       });
     }
 
-    return results;
-  });
+    return out;
+  }, isBadLink.toString());
 }
 
-function formatCard(card) {
-  const title = card.text.split('\n')[0].slice(0, 140);
-  return `• <b>${escapeHtml(title)}</b>\n${escapeHtml(card.text)}\n${escapeHtml(card.href)}`;
+function formatListing(item) {
+  const firstLine = item.text.split('\n')[0].slice(0, 140);
+  return `• <b>${escapeHtml(firstLine)}</b>\n${escapeHtml(item.text)}\n${escapeHtml(item.href)}`;
 }
 
 async function checkApartments() {
-  ensureDirs();
+  ensureDebugDir();
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox']
-  });
-
-  const context = await browser.newContext({
-    ...devices['iPhone 13 Pro'],
-    locale: 'de-DE'
-  });
-
+  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
+  const context = await browser.newContext({ ...devices['iPhone 13 Pro'], locale: 'de-DE' });
   const page = await context.newPage();
 
   try {
     await login(page);
     await openFinder(page);
 
-    const html = await page.content();
-    fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), html);
+    fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), await page.content());
     await page.screenshot({ path: path.join(DEBUG_DIR, 'last.png'), fullPage: true }).catch(() => {});
 
     const listings = await extractListings(page);
@@ -180,8 +189,12 @@ async function checkApartments() {
       state.firstRun = false;
       saveState();
 
-      const msg = `<b>Бот запущен</b>\nНайдено квартир: ${listings.length}` +
-        (listings.length ? `\n\n${listings.slice(0, 10).map(formatCard).join('\n\n')}` : '\n\nСписок пуст или селектор не нашёл карточки.');
+      const msg =
+        `<b>Бот запущен</b>\n` +
+        `Найдено квартир: ${listings.length}` +
+        (listings.length
+          ? `\n\n${listings.slice(0, 10).map(formatListing).join('\n\n')}`
+          : `\n\nНе нашёл карточки квартир. Сохранился HTML и скрин в /tmp/inberlin_debug`);
 
       await sendTelegram(msg, listings[0]?.href || PERSONAL_WOHNUNGSFINDER_URL);
       return;
@@ -195,33 +208,32 @@ async function checkApartments() {
       return;
     }
 
-    const messageParts = [];
+    const parts = [];
 
-    if (added.length > 0) {
-      messageParts.push(
+    if (added.length) {
+      parts.push(
         `<b>Добавили квартир: ${added.length}</b>\n\n` +
-        added.map(formatCard).join('\n\n')
+        added.map(formatListing).join('\n\n')
       );
     }
 
-    if (removed.length > 0) {
-      messageParts.push(
+    if (removed.length) {
+      parts.push(
         `<b>Убрали квартир: ${removed.length}</b>\n\n` +
         removed.map(h => `• ${escapeHtml(h)}`).join('\n')
       );
     }
 
     const buttonUrl = added[0]?.href || listings[0]?.href || PERSONAL_WOHNUNGSFINDER_URL;
-    for (const msg of messageParts) {
+    for (const msg of parts) {
       await sendTelegram(msg, buttonUrl);
     }
 
     state.seen = current;
     saveState();
   } catch (e) {
-    const err = `Ошибка: ${escapeHtml(e.message)}`;
-    await sendTelegram(err).catch(() => {});
     console.error(e);
+    await sendTelegram(`Ошибка: ${escapeHtml(e.message)}`).catch(() => {});
   } finally {
     await page.close().catch(() => {});
     await context.close().catch(() => {});
@@ -233,7 +245,7 @@ async function main() {
   loadState();
 
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID || !INBERLIN_EMAIL || !INBERLIN_PASSWORD) {
-    throw new Error('Не заданы переменные TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, INBERLIN_EMAIL, INBERLIN_PASSWORD');
+    throw new Error('Не заданы TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, INBERLIN_EMAIL, INBERLIN_PASSWORD');
   }
 
   await checkApartments();
