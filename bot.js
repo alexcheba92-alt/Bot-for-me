@@ -26,9 +26,7 @@ function saveSeen() {
 
 async function sendTelegram(text, url = null) {
     const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
-    if (url) {
-        payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
-    }
+    if (url) payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload);
         console.log('✅ Telegram OK');
@@ -40,7 +38,10 @@ async function checkApartments() {
     console.log(`[${now}] Запуск проверки...`);
 
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-    const page = await browser.newContext({ ...devices['iPhone 13 Pro'], locale: 'de-DE' }).then(c => c.newPage());
+    const page = await browser.newContext({ 
+        ...devices['iPhone 13 Pro'], 
+        locale: 'de-DE' 
+    }).then(c => c.newPage());
 
     try {
         await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -53,18 +54,18 @@ async function checkApartments() {
             await page.waitForTimeout(8000);
         }
 
-        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 90000 });
-        await page.waitForTimeout(20000);
+        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'domcontentloaded', timeout: 90000 });
+        await page.waitForTimeout(25000); // длинная пауза
 
         await page.screenshot({ path: '/tmp/last_page.png' });
-        console.log('Скриншот сохранён');
+        console.log('✅ Скриншот сохранён (/tmp/last_page.png)');
 
         const apartments = await page.evaluate(() => {
             const results = [];
             document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
-                if (href.length > 60 && (href.includes('/expose/') || href.includes('howoge') || href.includes('gewobag') || href.includes('degewo') || href.includes('stadtundland'))) {
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
+                if (href.length > 50 && (href.includes('/expose/') || href.includes('howoge') || href.includes('gewobag') || href.includes('degewo') || href.includes('stadtundland'))) {
                     results.push({ href, text });
                 }
             });
@@ -114,7 +115,7 @@ async function checkApartments() {
 async function main() {
     loadSeen();
     console.log('🤖 Бот запущен');
-    await sendTelegram('🤖 Бот перезапущен.');
+    await sendTelegram('🤖 Бот перезапущен. Пытаюсь ловить...');
 
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
