@@ -50,22 +50,21 @@ async function checkApartments() {
         }
 
         await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 120000 });
-        await page.waitForTimeout(30000); // длинная пауза
+        await page.waitForTimeout(30000);
 
         await page.screenshot({ path: '/tmp/last_page.png' });
         console.log('✅ Скриншот сохранён');
 
-        // Максимально агрессивный парсинг
         const apartments = await page.evaluate(() => {
             const results = [];
             document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 150);
                 if (href.length > 50 && 
                     (href.includes('/expose/') || 
                      href.includes('howoge') || href.includes('gewobag') || 
                      href.includes('degewo') || href.includes('stadtundland') || 
-                     href.includes('wohnung') || href.includes('immobilie'))) {
+                     href.includes('wohnung') || href.includes('immobilien'))) {
                     results.push({ href, text });
                 }
             });
@@ -75,29 +74,24 @@ async function checkApartments() {
         console.log(`Найдено ссылок: ${apartments.length}`);
 
         let newCount = 0;
-        const isFirst = seen.size === 0;
 
         for (const apt of apartments) {
             if (!seen.has(apt.href)) {
                 seen.add(apt.href);
                 newCount++;
 
-                if (!isFirst) {
-                    const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
-                    await sendTelegram(
-                        `🚨 <b>НОВАЯ КВАРТИРА!</b> 🏠\n\n` +
-                        `🕒 ${time}\n` +
-                        `🔗 ${apt.href}\n\n` +
-                        `📝 ${apt.text}...`,
-                        apt.href
-                    );
-                }
+                const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
+                await sendTelegram(
+                    `🚨 <b>НОВАЯ КВАРТИРА!</b> 🏠\n\n` +
+                    `🕒 ${time}\n` +
+                    `🔗 ${apt.href}\n\n` +
+                    `📝 ${apt.text}...`,
+                    apt.href
+                );
             }
         }
 
-        if (isFirst) {
-            await sendTelegram(`🤖 Бот запущен!\nНайдено на старте: ${seen.size} квартир`);
-        } else if (newCount > 0) {
+        if (newCount > 0) {
             console.log(`✅ Отправлено ${newCount} новых квартир`);
         } else {
             console.log('Новых квартир нет');
@@ -115,7 +109,7 @@ async function checkApartments() {
 async function main() {
     loadSeen();
     console.log('🤖 Бот запущен');
-    await sendTelegram('🤖 Бот перезапущен.');
+    await sendTelegram('🤖 Бот перезапущен. Ищу все квартиры по фильтру.');
 
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
