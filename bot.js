@@ -38,7 +38,7 @@ const C = {
 
   // Фильтры поиска
   maxRent:    600,   // Kaltmiete €
-  minRooms:   2,     // минимум комнат
+  minRooms:   3,     // минимум комнат (3-комнатные)
 
   intervalMs: 5 * 60 * 1000,  // 5 минут
 
@@ -275,7 +275,11 @@ async function scrape(page) {
   // Если API не дал данных — парсим HTML страницу
   if (apartments.length === 0) {
     apartments = await parseHtml(page);
-    log(`Из HTML извлечено квартир: ${apartments.length}`);
+  log(`Из HTML извлечено квартир: ${apartments.length}`);
+  // Дебаг — первые 3 карточки в лог чтобы видеть что парсится
+  apartments.slice(0, 3).forEach((a, i) =>
+    log(`КАРТОЧКА[${i}]: комнат=${a.rooms} аренда=${a.rent}€ адрес=${a.address} url=${a.url.slice(0, 60)}`)
+  );
   }
 
   return { apartments, ssPath };
@@ -547,9 +551,15 @@ async function extractCardData(card) {
 
   if (!url) url = C.finderUrl;
 
-  const rent  = extractNum(text, /(\d[\d\s.,]*)\s*€/);
-  const rooms = extractNum(text, /(\d[,.]?\d*)\s*(Zimmer|Zi\b)/i);
-  const size  = extractNum(text, /(\d[\d.,]*)\s*m²/i);
+  const rent  = extractNum(text, /(\d[\d.,]*)\s*€/) ||
+                extractNum(text, /Kaltmiete[:\s]*(\d[\d.,]*)/i) ||
+                extractNum(text, /(\d[\d.,]*)\s*EUR/i);
+  const rooms = extractNum(text, /(\d[,.]?\d*)\s*(?:Zimmer|Zi\.|Zi\b|Raum|Räume)/i) ||
+                extractNum(text, /(\d[,.]?\d*)-?Zimmer/i) ||
+                extractNum(text, /Zimmer[:\s]*(\d[,.]?\d*)/i);
+  const size  = extractNum(text, /(\d[\d.,]*)\s*m²/i) ||
+                extractNum(text, /(\d[\d.,]*)\s*qm/i) ||
+                extractNum(text, /Wohnfläche[:\s]*(\d[\d.,]*)/i);
 
   const id = url !== C.finderUrl ? url : `${rent}_${rooms}_${size}_${text.slice(0, 30)}`;
 
@@ -593,9 +603,12 @@ async function parseByLinks(page) {
         return el.innerText || '';
       }).catch(() => '');
 
-      const rent  = extractNum(parentText, /(\d[\d\s.,]*)\s*€/);
-      const rooms = extractNum(parentText, /(\d[,.]?\d*)\s*(Zimmer|Zi\b)/i);
-      const size  = extractNum(parentText, /(\d[\d.,]*)\s*m²/i);
+      const rent  = extractNum(parentText, /(\d[\d.,]*)\s*€/) ||
+                    extractNum(parentText, /Kaltmiete[:\s]*(\d[\d.,]*)/i);
+      const rooms = extractNum(parentText, /(\d[,.]?\d*)\s*(?:Zimmer|Zi\.|Zi\b|Raum|Räume)/i) ||
+                    extractNum(parentText, /(\d[,.]?\d*)-?Zimmer/i);
+      const size  = extractNum(parentText, /(\d[\d.,]*)\s*m²/i) ||
+                    extractNum(parentText, /(\d[\d.,]*)\s*qm/i);
 
       if (result.find(a => a.id === fullUrl)) continue;
 
@@ -657,9 +670,10 @@ function extractCompany(text) {
 function passesFilter(apt) {
   const rent  = parseFloat(apt.rent)  || 0;
   const rooms = parseFloat(apt.rooms) || 0;
-  // Пропускаем если данных нет (не можем отфильтровать)
-  if (rent  > 0 && rent  > C.maxRent + 30) return false;
-  if (rooms > 0 && rooms < C.minRooms)     return false;
+  // Фильтр по цене — если цена известна и превышает лимит
+  if (rent  > 0 && rent  > C.maxRent) return false;
+  // Фильтр по комнатам — если количество известно и меньше минимума
+  if (rooms > 0 && rooms < C.minRooms) return false;
   return true;
 }
 
