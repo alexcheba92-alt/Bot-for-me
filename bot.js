@@ -1,132 +1,111 @@
-'use strict';
-
-const { chromium } = require('playwright');
+const { chromium, devices } = require('playwright');
 const axios = require('axios');
 const fs = require('fs');
 
-const CONFIG = {
-    loginUrl: 'https://www.inberlinwohnen.de/login/',
-    finderUrl: 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/',
-    login: process.env.INBERLIN_EMAIL,
-    password: process.env.INBERLIN_PASSWORD,
-    tgToken: process.env.TELEGRAM_TOKEN,
-    tgChatId: process.env.TELEGRAM_CHAT_ID,
-    intervalMs: 300000,
-    seenPath: './out/seen.json'
-};
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const INBERLIN_EMAIL = process.env.INBERLIN_EMAIL;
+const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD;
+
+const CHECK_INTERVAL = 300000; // 5 минут
+const SEEN_FILE = '/tmp/seen.json';
 
 let seen = new Set();
-if (fs.existsSync(CONFIG.seenPath)) {
+
+function loadSeen() {
     try {
-        seen = new Set(JSON.parse(fs.readFileSync(CONFIG.seenPath)));
-    } catch {}
+        if (fs.existsSync(SEEN_FILE)) {
+            seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
+            console.log(`Загружено ${seen.size} квартир`);
+        }
+    } catch (e) {}
 }
 
-async function tg(text) {
-    if (!CONFIG.tgToken || !CONFIG.tgChatId) return;
+function saveSeen() {
     try {
-        await axios.post(`https://api.telegram.org/bot${CONFIG.tgToken}/sendMessage`, {
-            chat_id: CONFIG.tgChatId,
-            text
+        fs.writeFileSync(SEEN_FILE, JSON.stringify([...seen]));
+    } catch (e) {}
+}
+
+async function sendTelegram(text, url = null) {
+    const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
+    if (url) {
+        payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
+    }
+    try {
+        await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload);
+        console.log('✅ Telegram отправлено');
+    } catch (e) {
+        console.error('Telegram error:', e.message);
+    }
+}
+
+async function checkApartments() {
+    const now = new Date().toLocaleTimeString('de-DE', { timeZone: 'Europe/Berlin' });
+    console.log(`[${now}] Запуск проверки...`);
+
+    const browser = await chromium.launch({ 
+        headless: true, 
+        args: ['--no-sandbox', '--disable-setuid-sandbox'] 
+    });
+
+    const context = await browser.newContext({
+        ...devices['iPhone 13 Pro'],
+        locale: 'de-DE',
+        timezoneId: 'Europe/Berlin',
+    });
+
+    const page = await context.newPage();
+
+    try {
+        // === ЛОГИН ===
+        console.log('Открываю страницу логина...');
+        await page.goto('https://www.inberlinwohnen.de/login/', { 
+            waitUntil: 'domcontentloaded', 
+            timeout: 60000 
         });
-    } catch (e) {
-        console.log('[TG ERROR]', e.message);
-    }
-}
 
-function log(...args) {
-    console.log(`[${new Date().toISOString()}]`, ...args);
-}
+        // Принимаем куки
+        await page.locator('button:has-text("Alle akzeptieren"), #uc-btn-accept-banner, button:has-text("Akzeptieren")')
+            .click({ timeout: 10000 }).catch(() => {});
 
-async function safeGoto(page, url) {
-    try {
-        const response = await page.goto(url, {
-            waitUntil: 'domcontentloaded',
-            timeout: 45000
+        // Заполняем форму
+        if (await page.isVisible('input[name="email"]', { timeout: 15000 })) {
+            await page.fill('input[name="email"]', INBERLIN_EMAIL);
+            await page.fill('input[name="password"]', INBERLIN_PASSWORD);
+            await page.click('button[type="submit"]');
+            await page.waitForTimeout(6000);
+            console.log('Логин выполнен');
+        }
+
+        // === WOHNUNGSFINDER ===
+        console.log('Открываю Wohnungsfinder...');
+        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { 
+            waitUntil: 'networkidle', 
+            timeout: 60000 
+        });
+        await page.waitForTimeout(8000);
+
+        // Фильтры
+        console.log('Применяю фильтры...');
+        await page.locator('input[name*="miete_bis"], input[placeholder*="Kaltmiete"]').last().fill('600').catch(() => {});
+        await page.locator('input[name*="zimmer"]').first().fill('3').catch(() => {});
+        await page.locator('button:has-text("Wohnung suchen"), button[type="submit"]').click().catch(() => {});
+        await page.waitForTimeout(12000);
+
+        // Парсинг
+        const apartments = await page.evaluate(() => {
+            const results = [];
+            document.querySelectorAll('a').forEach(a => {
+                const href = a.href.trim();
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
+                if (href && (href.includes('/expose/') || 
+                    href.includes('howoge.de') || href.includes('gewobag.de') || 
+                    href.includes('degewo.de') || href.includes('stadtundland.de'))) {
+                    results.push({ href, text });
+                }
+            });
+            return results;
         });
 
-        if (!response) return { ok: false, reason: 'NO_RESPONSE' };
-
-        const headers = response.headers();
-        const ct = headers['content-type'] || '';
-        const cd = headers['content-disposition'] || '';
-
-        if (
-            ct.includes('octet-stream') ||
-            ct.includes('application/pdf') ||
-            cd.includes('attachment')
-        ) {
-            return { ok: false, reason: 'FILE_RESPONSE' };
-        }
-
-        return { ok: true };
-
-    } catch (e) {
-        return { ok: false, reason: e.message };
-    }
-}
-
-async function runCycle() {
-    const browser = await chromium.launch({ headless: true });
-    const page = await browser.newPage();
-
-    try {
-        log('START CYCLE');
-
-        // LOGIN PAGE
-        const loginNav = await safeGoto(page, CONFIG.loginUrl);
-        if (!loginNav.ok) {
-            log('LOGIN NAV FAILED:', loginNav.reason);
-            await tg(`⚠️ LOGIN FAILED: ${loginNav.reason}`);
-            return;
-        }
-
-        await page.fill('input[type="email"], input[name="email"]', CONFIG.login);
-        await page.fill('input[type="password"]', CONFIG.password);
-        await page.click('button[type="submit"]');
-
-        await page.waitForTimeout(5000);
-
-        // FINDER PAGE
-        const finderNav = await safeGoto(page, CONFIG.finderUrl);
-        if (!finderNav.ok) {
-            log('FINDER NAV FAILED:', finderNav.reason);
-            await tg(`⚠️ FINDER FAILED: ${finderNav.reason}`);
-            return;
-        }
-
-        await page.waitForSelector('a[href*="/expose/"]', { timeout: 20000 });
-
-        const links = await page.$$eval('a[href*="/expose/"]', els =>
-            [...new Set(els.map(e => e.href))]
-        );
-
-        log('FOUND:', links.length);
-
-        for (const url of links) {
-            if (seen.has(url)) continue;
-
-            seen.add(url);
-            fs.writeFileSync(CONFIG.seenPath, JSON.stringify([...seen]));
-
-            await tg(`🏠 New flat:\n${url}`);
-        }
-
-    } catch (e) {
-        log('CYCLE ERROR:', e.message);
-    } finally {
-        await browser.close();
-    }
-}
-
-async function startService() {
-    log('SERVICE STARTED');
-
-    while (true) {
-        await runCycle().catch(e => log('FATAL:', e.message));
-
-        await new Promise(r => setTimeout(r, CONFIG.intervalMs));
-    }
-}
-
-startService();
+        console.log(`Найдено
