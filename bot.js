@@ -1,42 +1,42 @@
 const { chromium, devices } = require('playwright');
 const axios = require('axios');
 const fs = require('fs');
+const path = require('path');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const INBERLIN_EMAIL = process.env.INBERLIN_EMAIL;
 const INBERLIN_PASSWORD = process.env.INBERLIN_PASSWORD;
 
-const CHECK_INTERVAL = 5 * 60 * 1000;
-const SEEN_FILE = '/tmp/inberlin_seen.json';
+const PERSONAL_WOHNUNGSFINDER_URL = 'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder?q=eyJpdiI6IkhuTjRkUVlnM0IzNHFxOEJ3SjJ1dUE9PSIsInZhbHVlIjoiQ3dTVWVUQzZoNkZnL291NXVDOSt0N0hNb3VqTE56RnE3bDM5S2h3QS9oWSt4cC96elJDZTNVWFkzaE9rN0ZmRmtpOTRPT01DWk5rVUVtSnZmMTZsWnlVYXkwNXZOMmEyYUtSNWRKaG9Sd0twTFVQOWdjZTVpWll5a2tRUW5XbkF5OFVRbnZYNnI1MjlmMmhFeS9ZeUdtY0RyL2tGZ2dnaUxobGlUWVY4ekQrcWtpSlAwVWVMSTdsRDhuVXJ6RW9ydS9aNUpkc2U0MmJmRytwSGdudDlHbFZmeWtUMkhITUxzRzM4SmRDN3ZLMzhERi9nSkc4VWxWZ01xbXY5VVdYVmcyU1BWTXhRc1NYTHBXa1lDK3dPNWp0MjVoU3JIS1R6NkhqcDUzbHpqVzRtRmF5UytXVmFaMjVDZ0JXekE4VTdFajhVQmtCT01adVQ1Z0o3SVBFNE9MS2lnMVUvWkI5cE5WYUk3b3FwcjVlKzB1cEZEQ1NPYzlvZkwxdW9uUEdraXlQUGUwL0pUdzRoNDY0RXlNTXViMzNGN1VKMXRIK2pVdEVvSVlJcjV1QVNJMUtyd0pxR2VBMXRjV2VudVNsOCIsIm1hYyI6ImEwZDYzZDFjMmU3MTc5M2Y4Y2I5YzI1ZjBhMTEyZGMwZDk5ZjlkYTNhNDcyMjkyMmE3MzA5NzY4MjE3ZjgwOWYiLCJ0YWciOiIifQ%3D%3D';
 
-let previousKeys = new Set();
-let firstRun = true;
-let lastSnapshot = [];
+const CHECK_INTERVAL = 5 * 60 * 1000;
+const STATE_FILE = '/tmp/inberlin_state.json';
+const DEBUG_DIR = '/tmp/inberlin_debug';
+
+let state = {
+  seen: [],
+  firstRun: true
+};
+
+function ensureDirs() {
+  if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
+}
 
 function loadState() {
   try {
-    if (fs.existsSync(SEEN_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8'));
-      previousKeys = new Set(raw.previousKeys || []);
-      lastSnapshot = raw.lastSnapshot || [];
-      firstRun = raw.firstRun ?? true;
+    if (fs.existsSync(STATE_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+      state.seen = Array.isArray(raw.seen) ? raw.seen : [];
+      state.firstRun = typeof raw.firstRun === 'boolean' ? raw.firstRun : true;
     }
-  } catch (e) {
-    previousKeys = new Set();
-    lastSnapshot = [];
-    firstRun = true;
+  } catch {
+    state = { seen: [], firstRun: true };
   }
 }
 
 function saveState() {
-  try {
-    fs.writeFileSync(SEEN_FILE, JSON.stringify({
-      previousKeys: [...previousKeys],
-      lastSnapshot,
-      firstRun
-    }, null, 2));
-  } catch (e) {}
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 function normalizeUrl(url) {
@@ -46,7 +46,7 @@ function normalizeUrl(url) {
     u.search = '';
     return u.toString().replace(/\/$/, '');
   } catch {
-    return url.trim().replace(/\/$/, '');
+    return String(url).trim().replace(/\/$/, '');
   }
 }
 
@@ -77,7 +77,7 @@ async function sendTelegram(text, url = null) {
   });
 }
 
-async function loginAndOpenFinder(page) {
+async function login(page) {
   await page.goto('https://www.inberlinwohnen.de/login/', {
     waitUntil: 'domcontentloaded',
     timeout: 60000
@@ -85,66 +85,72 @@ async function loginAndOpenFinder(page) {
 
   await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
 
-  const emailInput = page.locator('input[name="email"]');
-  if (await emailInput.count()) {
-    await emailInput.fill(INBERLIN_EMAIL);
+  const email = page.locator('input[name="email"]');
+  if (await email.count()) {
+    await email.fill(INBERLIN_EMAIL);
     await page.locator('input[name="password"]').fill(INBERLIN_PASSWORD);
     await page.locator('button[type="submit"]').click();
     await page.waitForLoadState('networkidle').catch(() => {});
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(6000);
   }
+}
 
-  await page.goto('https://www.inberlinwohnen.de/wohnungsfinder/', {
+async function openFinder(page) {
+  await page.goto(PERSONAL_WOHNUNGSFINDER_URL, {
     waitUntil: 'networkidle',
     timeout: 120000
   });
-
   await page.waitForTimeout(5000);
 }
 
-async function extractApartments(page) {
+async function extractListings(page) {
   return await page.evaluate(() => {
-    const out = [];
+    const results = [];
     const seen = new Set();
 
-    const candidates = Array.from(document.querySelectorAll('a[href]'));
-    for (const a of candidates) {
-      const href = (a.href || '').trim();
-      const text = (a.textContent || '').replace(/\s+/g, ' ').trim();
+    const candidates = Array.from(document.querySelectorAll('a[href], article, li, .card, .result, .listing, .listing-item, .offer, .angebot'));
 
-      if (!href || !text) continue;
+    for (const node of candidates) {
+      const root = node.matches && node.matches('a[href]') ? node : node.querySelector?.('a[href]');
+      if (!root) continue;
+
+      const href = root.href ? root.href.trim() : '';
+      if (!href) continue;
+
+      const text = (node.innerText || node.textContent || root.textContent || '').replace(/\s+/g, ' ').trim();
+      if (!text) continue;
+
       if (!href.includes('inberlinwohnen.de')) continue;
+      if (href.includes('/login') || href.includes('/wohnungsfinder/') || href.includes('/wohnungstausch') || href.endsWith('#')) continue;
 
-      const looksLikeApartment =
-        href.includes('/expose/') ||
-        href.includes('/wohnungsfinder/') ||
-        href.includes('wohnung') ||
-        /(\bqm\b|\bzimmer\b|\bwarmmiete\b|\bkaltmiete\b)/i.test(text);
+      const score =
+        (/zimmer|qm|m²|kaltmiete|warmmiete|€|euro|bezirk|berlin/i.test(text) ? 1 : 0) +
+        (/expose|wohnung|angebot|wohnungssuche|wohnungsangebot/i.test(text) ? 1 : 0);
 
-      if (!looksLikeApartment) continue;
+      if (score < 1) continue;
 
       const key = href.replace(/\/$/, '').split('?')[0];
       if (seen.has(key)) continue;
       seen.add(key);
 
-      out.push({ href: key, text });
+      results.push({
+        href: key,
+        text: text.slice(0, 400)
+      });
     }
 
-    return out;
+    return results;
   });
 }
 
-function buildMessage(title, items) {
-  const lines = [`<b>${escapeHtml(title)}</b>`, ''];
-  for (const item of items) {
-    lines.push(`• <b>${escapeHtml(item.title || 'Квартира')}</b>`);
-    if (item.details) lines.push(`${escapeHtml(item.details)}`);
-    lines.push('');
-  }
-  return lines.join('\n').trim();
+function formatCard(card) {
+  const title = card.text.split('\n')[0].slice(0, 140);
+  return `• <b>${escapeHtml(title)}</b>\n${escapeHtml(card.text)}\n${escapeHtml(card.href)}`;
 }
 
 async function checkApartments() {
+  ensureDirs();
+
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox']
@@ -158,71 +164,64 @@ async function checkApartments() {
   const page = await context.newPage();
 
   try {
-    await loginAndOpenFinder(page);
+    await login(page);
+    await openFinder(page);
 
-    const apartments = await extractApartments(page);
-    const currentKeys = new Set(apartments.map(a => normalizeUrl(a.href)));
+    const html = await page.content();
+    fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), html);
+    await page.screenshot({ path: path.join(DEBUG_DIR, 'last.png'), fullPage: true }).catch(() => {});
 
-    const added = apartments.filter(a => !previousKeys.has(normalizeUrl(a.href)));
-    const removed = [...previousKeys]
-      .filter(k => !currentKeys.has(k));
+    const listings = await extractListings(page);
+    const current = listings.map(x => normalizeUrl(x.href));
+    const previous = new Set(state.seen);
 
-    if (firstRun) {
-      previousKeys = currentKeys;
-      lastSnapshot = apartments;
-      firstRun = false;
+    if (state.firstRun) {
+      state.seen = current;
+      state.firstRun = false;
       saveState();
 
-      const msg = buildMessage(
-        `Бот запущен. Найдено квартир: ${apartments.length}`,
-        apartments.slice(0, 10).map(a => ({
-          title: a.text.slice(0, 120),
-          details: a.href
-        }))
-      );
+      const msg = `<b>Бот запущен</b>\nНайдено квартир: ${listings.length}` +
+        (listings.length ? `\n\n${listings.slice(0, 10).map(formatCard).join('\n\n')}` : '\n\nСписок пуст или селектор не нашёл карточки.');
 
-      await sendTelegram(msg);
+      await sendTelegram(msg, listings[0]?.href || PERSONAL_WOHNUNGSFINDER_URL);
       return;
     }
+
+    const added = listings.filter(x => !previous.has(normalizeUrl(x.href)));
+    const removed = [...previous].filter(x => !current.includes(x));
 
     if (added.length === 0 && removed.length === 0) {
       console.log('Изменений нет');
       return;
     }
 
-    const chunks = [];
+    const messageParts = [];
 
     if (added.length > 0) {
-      chunks.push(buildMessage(
-        `Новые квартиры: ${added.length}`,
-        added.map(a => ({
-          title: a.text.slice(0, 120),
-          details: a.href
-        }))
-      ));
+      messageParts.push(
+        `<b>Добавили квартир: ${added.length}</b>\n\n` +
+        added.map(formatCard).join('\n\n')
+      );
     }
 
     if (removed.length > 0) {
-      chunks.push(buildMessage(
-        `Удалённые квартиры: ${removed.length}`,
-        removed.map(href => ({
-          title: 'Квартира исчезла из списка',
-          details: href
-        }))
-      ));
+      messageParts.push(
+        `<b>Убрали квартир: ${removed.length}</b>\n\n` +
+        removed.map(h => `• ${escapeHtml(h)}`).join('\n')
+      );
     }
 
-    for (const part of chunks) {
-      const first = added[0] || apartments[0] || null;
-      const buttonUrl = first ? first.href : null;
-      await sendTelegram(part, buttonUrl);
+    const buttonUrl = added[0]?.href || listings[0]?.href || PERSONAL_WOHNUNGSFINDER_URL;
+    for (const msg of messageParts) {
+      await sendTelegram(msg, buttonUrl);
     }
 
-    previousKeys = currentKeys;
-    lastSnapshot = apartments;
+    state.seen = current;
     saveState();
   } catch (e) {
-    console.error('Ошибка проверки:', e.message);
+    const err = `Ошибка: ${escapeHtml(e.message)}`;
+    await sendTelegram(err).catch(() => {});
+    console.error(e);
   } finally {
     await page.close().catch(() => {});
     await context.close().catch(() => {});
@@ -234,12 +233,12 @@ async function main() {
   loadState();
 
   if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID || !INBERLIN_EMAIL || !INBERLIN_PASSWORD) {
-    throw new Error('Не заданы TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, INBERLIN_EMAIL или INBERLIN_PASSWORD');
+    throw new Error('Не заданы переменные TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, INBERLIN_EMAIL, INBERLIN_PASSWORD');
   }
 
   await checkApartments();
   setInterval(() => {
-    checkApartments().catch(err => console.error('Fatal check error:', err.message));
+    checkApartments().catch(err => console.error(err));
   }, CHECK_INTERVAL);
 }
 
