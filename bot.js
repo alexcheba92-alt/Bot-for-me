@@ -1,5 +1,5 @@
-const axios = require('axios');
 const { chromium, devices } = require('playwright');
+const axios = require('axios');
 const fs = require('fs');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -16,7 +16,6 @@ function loadSeen() {
     try {
         if (fs.existsSync(SEEN_FILE)) {
             seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
-            console.log(`Загружено ${seen.size} квартир`);
         }
     } catch (e) {}
 }
@@ -44,7 +43,6 @@ async function checkApartments() {
     const page = await browser.newContext({ ...devices['iPhone 13 Pro'], locale: 'de-DE' }).then(c => c.newPage());
 
     try {
-        // Логин
         await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
 
@@ -52,38 +50,29 @@ async function checkApartments() {
             await page.fill('input[name="email"]', INBERLIN_EMAIL);
             await page.fill('input[name="password"]', INBERLIN_PASSWORD);
             await page.click('button[type="submit"]');
-            await page.waitForTimeout(5000);
+            await page.waitForTimeout(6000);
         }
 
-        // Основная страница
         await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForTimeout(10000);
+        await page.waitForTimeout(12000); // длинная пауза
 
-        // Фильтры
-        await page.locator('input[name*="miete"], input[placeholder*="Kalt"]').last().fill('600').catch(() => {});
+        // Применяем фильтры
+        await page.locator('input[name*="miete_bis"], input[placeholder*="Kaltmiete"]').last().fill('600').catch(() => {});
         await page.locator('input[name*="zimmer"]').first().fill('3').catch(() => {});
         await page.locator('button:has-text("Wohnung suchen"), button[type="submit"]').click().catch(() => {});
-        await page.waitForTimeout(12000);
+        await page.waitForTimeout(15000);
 
-        // Улучшенный парсинг
+        // Максимально агрессивный парсинг
         const apartments = await page.evaluate(() => {
             const results = [];
-            const links = document.querySelectorAll('a');
-
-            links.forEach(a => {
+            document.querySelectorAll('a').forEach(a => {
                 const href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
-
-                if (href.length < 40) return;
-
-                if (href.includes('/expose/') || 
-                    href.includes('/wohnung/') || 
-                    (href.includes('howoge.de') || href.includes('gewobag.de') || 
-                     href.includes('degewo.de') || href.includes('stadtundland.de'))) {
-                    
-                    if (!href.includes('/unternehmen/') && !href.includes('impressum')) {
-                        results.push({ href, text });
-                    }
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
+                if (href && href.length > 50 && 
+                    (href.includes('/expose/') || 
+                     href.includes('howoge') || href.includes('gewobag') || 
+                     href.includes('degewo') || href.includes('stadtundland'))) {
+                    results.push({ href, text });
                 }
             });
             return results;
@@ -92,16 +81,15 @@ async function checkApartments() {
         console.log(`Найдено потенциальных ссылок: ${apartments.length}`);
 
         let newCount = 0;
-        const isFirstRun = seen.size === 0;
+        const isFirst = seen.size === 0;
 
         for (const apt of apartments) {
             const id = apt.href;
-
             if (!seen.has(id)) {
                 seen.add(id);
                 newCount++;
 
-                if (!isFirstRun) {
+                if (!isFirst) {
                     const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
                     await sendTelegram(
                         `🚨 <b>НОВАЯ КВАРТИРА!</b> 🏠\n\n` +
@@ -114,7 +102,7 @@ async function checkApartments() {
             }
         }
 
-        if (isFirstRun) {
+        if (isFirst) {
             await sendTelegram(`🤖 Бот запущен!\nНайдено на старте: ${seen.size} квартир`);
         } else if (newCount > 0) {
             console.log(`✅ Отправлено ${newCount} новых квартир`);
@@ -134,7 +122,7 @@ async function checkApartments() {
 async function main() {
     loadSeen();
     console.log('🤖 Бот запущен');
-    await sendTelegram('🤖 Бот перезапущен. Начинаю мониторинг 3-комнатных до 600€.');
+    await sendTelegram('🤖 Бот перезапущен. Мониторим...');
 
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
