@@ -39,7 +39,6 @@ async function checkApartments() {
     const page = await browser.newContext({ ...devices['iPhone 13 Pro'], locale: 'de-DE' }).then(c => c.newPage());
 
     try {
-        // Логин
         await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 60000 });
         await page.locator('button:has-text("Alle akzeptieren")').click().catch(() => {});
 
@@ -50,24 +49,21 @@ async function checkApartments() {
             await page.waitForTimeout(8000);
         }
 
-        // Переход на поисковик
         await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 90000 });
-        await page.waitForTimeout(15000);
+        await page.waitForTimeout(20000); // очень длинная пауза
 
-        // Фильтры
-        await page.locator('input[name*="miete_bis"], input[placeholder*="Kaltmiete"]').last().fill('600').catch(() => {});
-        await page.locator('input[name*="zimmer"]').first().fill('3').catch(() => {});
-        await page.locator('button:has-text("Wohnung suchen"), button[type="submit"]').click().catch(() => {});
-        await page.waitForTimeout(20000); // длинная пауза
+        // Сохраняем скриншот для дебага
+        await page.screenshot({ path: '/tmp/last_page.png' });
+        console.log('Скриншот сохранён (/tmp/last_page.png)');
 
-        // Агрессивный парсинг
         const apartments = await page.evaluate(() => {
             const results = [];
             document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.href.trim();
                 const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
                 if (href.length > 60 && 
-                    (href.includes('/expose/') || href.includes('howoge') || href.includes('gewobag') || 
+                    (href.includes('/expose/') || 
+                     href.includes('howoge') || href.includes('gewobag') || 
                      href.includes('degewo') || href.includes('stadtundland'))) {
                     results.push({ href, text });
                 }
@@ -118,7 +114,7 @@ async function checkApartments() {
 async function main() {
     loadSeen();
     console.log('🤖 Бот запущен');
-    await sendTelegram('🤖 Бот перезапущен. Пытаюсь ловить все квартиры.');
+    await sendTelegram('🤖 Бот перезапущен. Пытаюсь ловить...');
 
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
