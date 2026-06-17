@@ -14,10 +14,7 @@ const CHECK_INTERVAL = 5 * 60 * 1000;
 const STATE_FILE = '/tmp/inberlin_state.json';
 const DEBUG_DIR = '/tmp/inberlin_debug';
 
-let state = {
-  seen: [],
-  firstRun: true
-};
+let state = { seen: [], firstRun: true };
 
 function ensureDirs() {
   if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
@@ -56,26 +53,6 @@ function escapeHtml(s = '') {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
-}
-
-function isBadLink(href) {
-  const h = String(href || '').toLowerCase();
-  return (
-    !h ||
-    h === 'https://www.inberlinwohnen.de' ||
-    h === 'https://www.inberlinwohnen.de/' ||
-    h.includes('/datenschutz') ||
-    h.includes('/impressum') ||
-    h.includes('/login') ||
-    h.includes('/kontakt') ||
-    h.includes('/wohnungsfinder') ||
-    h.includes('/wohnungstausch') ||
-    h.includes('/wohnungsvergabe') ||
-    h.includes('/mein-bereich') ||
-    h.endsWith('#') ||
-    h.includes('mailto:') ||
-    h.includes('javascript:')
-  );
 }
 
 async function sendTelegram(text, url = null) {
@@ -117,114 +94,135 @@ async function login(page) {
 
 async function openFinder(page) {
   await page.goto(PERSONAL_WOHNUNGSFINDER_URL, {
-    waitUntil: 'networkidle',
+    waitUntil: 'domcontentloaded',
     timeout: 120000
   });
-  await page.waitForTimeout(6000);
+  await page.waitForTimeout(8000);
 }
 
-async function dumpDebug(page) {
-  ensureDirs();
-  const html = await page.content();
-  fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), html);
-  await page.screenshot({ path: path.join(DEBUG_DIR, 'last.png'), fullPage: true }).catch(() => {});
-  const signals = await page.evaluate(() => {
-    const arr = Array.from(document.querySelectorAll('body *'))
-      .map(el => (el.innerText || '').replace(/\s+/g, ' ').trim())
-      .filter(t => t.length > 25)
-      .filter(t => /zimmer|qm|m²|€|euro|kaltmiete|warmmiete|bezirk|wohnung|angebot|expose/i.test(t))
-      .slice(0, 100);
-    return arr;
+function isInterestingJson(obj) {
+  const s = JSON.stringify(obj).toLowerCase();
+  return /wohnung|kaltmiete|warmmiete|zimmer|qm|m²|berlin|expose|angebot/.test(s);
+}
+
+function extractFromJson(value) {
+  const out = [];
+
+  const walk = (node) => {
+    if (!node) return;
+    if (Array.isArray(node)) {
+      for (const x of node) walk(x);
+      return;
+    }
+    if (typeof node !== 'object') return;
+
+    const keys = Object.keys(node).map(k => k.toLowerCase());
+    const text = JSON.stringify(node).toLowerCase();
+
+    if (isInterestingJson(node)) {
+      let href = null;
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (typeof v === 'string' && v.includes('inberlinwohnen.de') && !v.includes('datenschutz') && !v.includes('impressum')) {
+          href = v;
+          break;
+        }
+      }
+
+      const title =
+        node.title ||
+        node.name ||
+        node.label ||
+        node.caption ||
+        node.heading ||
+        node.objekt ||
+        node.address ||
+        node.wohnungsname ||
+        '';
+
+      const price =
+        node.price ||
+        node.miete ||
+        node.kaltmiete ||
+        node.warmmiete ||
+        '';
+
+      const rooms =
+        node.rooms ||
+        node.zimmer ||
+        node.roomCount ||
+        '';
+
+      const area =
+        node.area ||
+        node.qm ||
+        node.size ||
+        node.flaeche ||
+        '';
+
+      const district =
+        node.district ||
+        node.bezirk ||
+        node.region ||
+        node.ort ||
+        '';
+
+      const summary = [title, price, rooms, area, district].filter(Boolean).join(' | ').trim();
+
+      if (href && summary) {
+        out.push({
+          href: normalizeUrl(href),
+          text: summary.slice(0, 500)
+        });
+      }
+    }
+
+    for (const v of Object.values(node)) walk(v);
+  };
+
+  walk(value);
+
+  const uniq = [];
+  const seen = new Set();
+  for (const x of out) {
+    if (!x.href || seen.has(x.href)) continue;
+    seen.add(x.href);
+    uniq.push(x);
+  }
+  return uniq;
+}
+
+async function collectNetworkData(page) {
+  const responses = [];
+  page.on('response', async (res) => {
+    try {
+      const url = res.url();
+      const ct = (res.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('json') && !ct.includes('javascript') && !ct.includes('text') && !ct.includes('html')) return;
+      if (!url.includes('inberlinwohnen.de')) return;
+
+      const body = await res.text();
+      responses.push({
+        url,
+        status: res.status(),
+        contentType: ct,
+        body: body.slice(0, 50000)
+      });
+    } catch {}
   });
-  fs.writeFileSync(path.join(DEBUG_DIR, 'signals.json'), JSON.stringify(signals, null, 2));
+  return responses;
 }
 
-async function extractListings(page) {
-  return await page.evaluate((badLinkFnStr) => {
-    const isBadLink = new Function(`return (${badLinkFnStr})`)();
-
-    const textScore = (t) => {
-      let score = 0;
-      if (/€|euro|kaltmiete|warmmiete/i.test(t)) score += 3;
-      if (/zimmer|qm|m²/i.test(t)) score += 3;
-      if (/bezirk|berlin/i.test(t)) score += 1;
-      if (/wohnung|angebot|expose/i.test(t)) score += 2;
-      return score;
-    };
-
-    const candidates = [];
-    const selectors = [
-      'article',
-      'li',
-      '.card',
-      '.result',
-      '.listing',
-      '.listing-item',
-      '.offer',
-      '.angebot',
-      'div'
-    ];
-
-    for (const sel of selectors) {
-      candidates.push(...Array.from(document.querySelectorAll(sel)));
-    }
-
-    const out = [];
-    const seen = new Set();
-
-    for (const node of candidates) {
-      const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!text || text.length < 30) continue;
-
-      const score = textScore(text);
-      if (score < 5) continue;
-
-      const links = Array.from(node.querySelectorAll('a[href]'));
-      const good = links.find(a => {
-        const href = (a.href || '').trim();
-        if (isBadLink(href)) return false;
-        if (!href.includes('inberlinwohnen.de')) return false;
-        return true;
-      });
-
-      if (!good) continue;
-
-      const href = good.href.replace(/\/$/, '').split('?')[0];
-      if (seen.has(href)) continue;
-      seen.add(href);
-
-      out.push({
-        href,
-        text: text.slice(0, 600)
-      });
-    }
-
-    const simpleAnchors = Array.from(document.querySelectorAll('a[href]'))
-      .map(a => ({
-        href: (a.href || '').trim(),
-        text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim()
-      }))
-      .filter(x => !isBadLink(x.href))
-      .filter(x => x.href.includes('inberlinwohnen.de'))
-      .filter(x => /€|euro|kaltmiete|warmmiete|zimmer|qm|m²|wohnung|angebot|expose/i.test(x.text));
-
-    for (const a of simpleAnchors) {
-      const href = a.href.replace(/\/$/, '').split('?')[0];
-      if (seen.has(href)) continue;
-      seen.add(href);
-      out.push({
-        href,
-        text: a.text.slice(0, 600)
-      });
-    }
-
-    return out;
-  }, isBadLink.toString());
+async function dumpDebug(page, responses) {
+  ensureDirs();
+  fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), await page.content());
+  await page.screenshot({ path: path.join(DEBUG_DIR, 'last.png'), fullPage: true }).catch(() => {});
+  fs.writeFileSync(path.join(DEBUG_DIR, 'responses.json'), JSON.stringify(responses, null, 2));
 }
 
 function formatListing(item) {
-  const title = (item.text.split('\n')[0] || item.href).slice(0, 140);
-  return `• <b>${escapeHtml(title)}</b>\n${escapeHtml(item.text)}\n${escapeHtml(item.href)}`;
+  const title = (item.text || item.href).slice(0, 140);
+  return `• <b>${escapeHtml(title)}</b>\n${escapeHtml(item.text || '')}\n${escapeHtml(item.href)}`;
 }
 
 async function checkApartments() {
@@ -241,13 +239,56 @@ async function checkApartments() {
   });
 
   const page = await context.newPage();
+  const responses = [];
+  page.on('response', async (res) => {
+    try {
+      const url = res.url();
+      if (!url.includes('inberlinwohnen.de')) return;
+      const ct = (res.headers()['content-type'] || '').toLowerCase();
+      if (!ct.includes('json') && !ct.includes('text') && !ct.includes('html') && !ct.includes('javascript')) return;
+      const body = await res.text();
+      responses.push({
+        url,
+        status: res.status(),
+        contentType: ct,
+        body: body.slice(0, 50000)
+      });
+    } catch {}
+  });
 
   try {
     await login(page);
     await openFinder(page);
-    await dumpDebug(page);
+    await page.waitForTimeout(5000);
 
-    const listings = await extractListings(page);
+    const html = await page.content();
+    fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), html);
+    await page.screenshot({ path: path.join(DEBUG_DIR, 'last.png'), fullPage: true }).catch(() => {});
+    fs.writeFileSync(path.join(DEBUG_DIR, 'responses.json'), JSON.stringify(responses, null, 2));
+
+    let listings = [];
+
+    for (const r of responses) {
+      const body = r.body || '';
+      if (body.startsWith('{') || body.startsWith('[')) {
+        try {
+          const json = JSON.parse(body);
+          const found = extractFromJson(json);
+          if (found.length) listings.push(...found);
+        } catch {}
+      }
+    }
+
+    listings = listings.filter(x => x.href && x.text);
+    const uniq = [];
+    const seen = new Set();
+    for (const x of listings) {
+      if (seen.has(x.href)) continue;
+      seen.add(x.href);
+      uniq.push(x);
+    }
+    listings = uniq;
+
     const current = listings.map(x => normalizeUrl(x.href));
     const previous = new Set(state.seen);
 
@@ -261,7 +302,7 @@ async function checkApartments() {
         `Найдено квартир: ${listings.length}` +
         (listings.length
           ? `\n\n${listings.slice(0, 10).map(formatListing).join('\n\n')}`
-          : `\n\nНе нашёл карточки квартир. Сохранился HTML и скрин в /tmp/inberlin_debug`);
+          : `\n\nНе нашёл карточки квартир. Сохранился HTML, скрин и network в /tmp/inberlin_debug`);
 
       await sendTelegram(msg, listings[0]?.href || PERSONAL_WOHNUNGSFINDER_URL);
       return;
@@ -300,6 +341,7 @@ async function checkApartments() {
     saveState();
   } catch (e) {
     console.error(e);
+    await dumpDebug(page, responses).catch(() => {});
     await sendTelegram(`Ошибка: ${escapeHtml(e.message)}`).catch(() => {});
   } finally {
     await page.close().catch(() => {});
