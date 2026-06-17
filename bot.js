@@ -1,68 +1,84 @@
 'use strict';
+
+require('dotenv').config();
 const axios = require('axios');
-const tough = require('tough-cookie');
 const { wrapper } = require('axios-cookiejar-support');
+const { CookieJar } = require('tough-cookie');
 const cheerio = require('cheerio');
 const qs = require('qs');
 
-const jar = new tough.CookieJar();
+// Настройка клиента
+const jar = new CookieJar();
 const client = wrapper(axios.create({
     jar,
     withCredentials: true,
-    timeout: 15000,
+    timeout: 20000,
     headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7'
     }
 }));
 
+async function login() {
+    console.log("--- Инициализация авторизации ---");
+    const response = await client.get('https://www.inberlinwohnen.de/login/');
+    const $ = cheerio.load(response.data);
+    const token = $('input[name="_token"]').val();
+
+    if (!token) throw new Error("Не удалось получить CSRF токен");
+
+    return await client.post('https://www.inberlinwohnen.de/login/', qs.stringify({
+        email: process.env.INBERLIN_EMAIL,
+        password: process.env.INBERLIN_PASSWORD,
+        _token: token
+    }), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+}
+
+async function fetchApartments() {
+    const response = await client.get('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/');
+    const $ = cheerio.load(response.data);
+    
+    const apartments = [];
+    $('a[href*="/expose/"]').each((_, el) => {
+        const link = $(el).attr('href');
+        if (link && !apartments.includes(link)) {
+            apartments.push(link);
+        }
+    });
+    return apartments;
+}
+
 async function runService() {
     try {
-        console.log("--- Начало цикла ---");
+        const finderPage = await client.get('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/');
         
-        // 1. Получаем страницу логина
-        const loginPage = await client.get('https://www.inberlinwohnen.de/login/');
-        const $ = cheerio.load(loginPage.data);
-        const csrfToken = $('input[name="_token"]').val();
-        
-        // 2. Логин
-        const loginRes = await client.post('https://www.inberlinwohnen.de/login/', qs.stringify({
-            email: process.env.INBERLIN_EMAIL,
-            password: process.env.INBERLIN_PASSWORD,
-            _token: csrfToken
-        }), {
-            headers: { 
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Referer': 'https://www.inberlinwohnen.de/login/',
-                'Origin': 'https://www.inberlinwohnen.de',
-                'X-Requested-With': 'XMLHttpRequest'
-            },
-            validateStatus: (status) => status < 500
-        });
-
-        console.log("Логин статус:", loginRes.status);
-        if (loginRes.status !== 200 && loginRes.status !== 302) {
-            console.log("Ошибка логина (ответ):", JSON.stringify(loginRes.data).slice(0, 200));
-            return;
+        // Проверка: если перекинуло на логин, значит сессия истекла
+        if (finderPage.request.path === '/login/') {
+            console.log("Сессия истекла, перелогиниваемся...");
+            await login();
+            return await runService();
         }
 
-        // 3. Finder
-        const finder = await client.get('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/');
-        const $$ = cheerio.load(finder.data);
-        const links = [];
-        $$('a[href*="/expose/"]').each((i, el) => { links.push($$(el).attr('href')); });
-
-        console.log("Найдено квартир:", links.length);
-        if (links.length > 0) console.log("Первая ссылка:", links[0]);
+        const links = await fetchApartments();
+        console.log(`[${new Date().toLocaleTimeString()}] Найдено объектов: ${links.length}`);
+        
+        if (links.length > 0) {
+            console.log("Актуальные ссылки:", links.slice(0, 3));
+        }
 
     } catch (e) {
-        console.error("Критическая ошибка:", e.message);
+        console.error("Ошибка при выполнении цикла:", e.message);
     }
 }
 
-// Запуск цикла
+// Запуск цикла с интервалом 5 минут
 (async () => {
+    console.log("Сервис запущен.");
     while(true) {
         await runService();
-        await new Promise(r => setTimeout(r, 300000));
+        await new Promise(resolve => setTimeout(resolve, 300000));
     }
 })();
