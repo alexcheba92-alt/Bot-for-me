@@ -4,7 +4,7 @@
  * ================================================================
  *  inberlinwohnen.de — Бот мониторинга квартир
  * ================================================================
- *  Переменные Railway:
+ *  Railway Variables:
  *    INBERLIN_EMAIL, INBERLIN_PASSWORD
  *    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
  * ================================================================
@@ -26,16 +26,15 @@ const C = {
   tgToken:    process.env.TELEGRAM_TOKEN    || '',
   tgChatId:   process.env.TELEGRAM_CHAT_ID  || '',
 
-  maxRent:    600,  // Kaltmiete макс €
-  minRooms:   3,    // минимум комнат
+  maxRent:   600,
+  minRooms:  3,
 
   intervalMs: 5 * 60 * 1000,
 
   loginUrl:  'https://www.inberlinwohnen.de/login',
   finderUrl: 'https://www.inberlinwohnen.de/wohnungsfinder',
   baseUrl:   'https://www.inberlinwohnen.de',
-
-  outDir: path.join(__dirname, 'out'),
+  outDir:    path.join(__dirname, 'out'),
 };
 
 if (!fs.existsSync(C.outDir)) fs.mkdirSync(C.outDir, { recursive: true });
@@ -70,7 +69,10 @@ function log(...a) {
 // ================================================================
 const stateFile = path.join(C.outDir, 'state.json');
 function loadState() {
-  try { if (fs.existsSync(stateFile)) return JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (_) {}
+  try {
+    if (fs.existsSync(stateFile))
+      return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  } catch (_) {}
   return { known: {}, lastCount: null, firstRun: true };
 }
 function saveState(s) { fs.writeFileSync(stateFile, JSON.stringify(s, null, 2)); }
@@ -84,7 +86,8 @@ const TG = `https://api.telegram.org/bot${C.tgToken}`;
 async function tgText(text, extra = {}) {
   try {
     await axios.post(`${TG}/sendMessage`, {
-      chat_id: C.tgChatId, text,
+      chat_id: C.tgChatId,
+      text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...extra,
@@ -99,11 +102,13 @@ async function tgPhoto(filePath, caption = '') {
     form.append('photo',      fs.createReadStream(filePath));
     form.append('caption',    caption.slice(0, 1024));
     form.append('parse_mode', 'HTML');
-    await axios.post(`${TG}/sendPhoto`, form, { headers: form.getHeaders(), timeout: 30000 });
+    await axios.post(`${TG}/sendPhoto`, form, {
+      headers: form.getHeaders(), timeout: 30000,
+    });
   } catch (e) { log('TG photo error:', e.message); }
 }
 
-function btn(url) {
+function ibwBtn(url) {
   return { inline_keyboard: [[{ text: '🔗 Открыть на inberlinwohnen.de', url }]] };
 }
 
@@ -114,83 +119,152 @@ function msgNew(apt) {
   const lines = [
     '🏠 <b>Новая квартира!</b>',
     '',
-    apt.title   ? `<b>${apt.title}</b>`            : null,
-    apt.address ? `📍 ${apt.address}`              : null,
-    apt.district? `🗺 ${apt.district}`             : null,
-    apt.rooms   ? `🛏 Комнат: <b>${apt.rooms}</b>` : null,
-    apt.size    ? `📐 <b>${apt.size} м²</b>`       : null,
-    apt.rent    ? `💶 Kaltmiete: <b>${apt.rent} €</b>` : null,
-    apt.company ? `🏢 ${apt.company}`              : null,
-    apt.wbs     ? `🔑 ${apt.wbs}`                 : null,
+    apt.title    ? `<b>${apt.title}</b>`                 : null,
+    apt.address  ? `📍 ${apt.address}`                   : null,
+    apt.district ? `🗺 Район: ${apt.district}`           : null,
+    apt.rooms    ? `🛏 Комнат: <b>${apt.rooms}</b>`      : null,
+    apt.size     ? `📐 Площадь: <b>${apt.size} м²</b>`  : null,
+    apt.rent     ? `💶 Kaltmiete: <b>${apt.rent} €</b>` : null,
+    apt.company  ? `🏢 ${apt.company}`                   : null,
+    apt.wbs      ? `🔑 ${apt.wbs}`                      : null,
   ].filter(Boolean).join('\n');
-  return { text: lines, markup: btn(apt.url) };
+  return { text: lines, markup: ibwBtn(apt.url) };
 }
 
 function msgGone(apt) {
   return [
-    '❌ <b>Квартира снята</b>',
+    '❌ <b>Квартира снята с публикации</b>',
     '',
-    apt.title   ? apt.title                     : null,
-    apt.address ? `📍 ${apt.address}`           : null,
-    apt.rooms   ? `🛏 ${apt.rooms} комн.`       : null,
-    apt.size    ? `📐 ${apt.size} м²`           : null,
-    apt.rent    ? `💶 ${apt.rent} €`            : null,
+    apt.title   ? apt.title                   : null,
+    apt.address ? `📍 ${apt.address}`         : null,
+    apt.rooms   ? `🛏 ${apt.rooms} комн.`    : null,
+    apt.size    ? `📐 ${apt.size} м²`        : null,
+    apt.rent    ? `💶 ${apt.rent} €`         : null,
     `🔗 ${apt.url}`,
   ].filter(Boolean).join('\n');
 }
 
 // ================================================================
-//  АВТОРИЗАЦИЯ
+//  АВТОРИЗАЦИЯ — переработанная
 // ================================================================
 async function doLogin(page) {
   log('Авторизация...');
+
   await page.goto(C.loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(2000);
 
-  // Закрыть cookie-попап
-  for (const s of ['button:has-text("Alle akzeptieren")', 'button:has-text("Akzeptieren")', 'button:has-text("Speichern")']) {
-    try {
-      const b = page.locator(s).first();
-      if (await b.isVisible({ timeout: 2000 })) { await b.click(); await page.waitForTimeout(800); break; }
-    } catch (_) {}
-  }
-
-  await page.locator('input[type="email"], input[name="email"]').first().fill(C.email);
-  await page.locator('input[type="password"], input[name="password"]').first().fill(C.password);
-
-  // Чекбокс "остаться в системе"
+  // Закрываем cookie-попап (сайт блокирует клики пока он открыт)
   try {
-    const cb = page.locator('input[type="checkbox"]').first();
-    if (await cb.isVisible({ timeout: 1000 })) await cb.check();
+    // Ищем кнопку "Alle akzeptieren" или "Speichern"
+    const cookieBtns = [
+      'text="Alle akzeptieren"',
+      'text="Speichern"',
+      'text="Akzeptieren"',
+      '[data-cookie-accept]',
+      '.cookie-accept',
+    ];
+    for (const sel of cookieBtns) {
+      try {
+        const btn = page.locator(sel).first();
+        if (await btn.isVisible({ timeout: 2000 })) {
+          await btn.click();
+          log('Cookie попап закрыт');
+          await page.waitForTimeout(1000);
+          break;
+        }
+      } catch (_) {}
+    }
   } catch (_) {}
 
-  await page.locator('button[type="submit"], input[type="submit"]').first().click();
-  await page.waitForURL(u => !u.includes('/login'), { timeout: 20000 }).catch(() => {});
+  // Скриншот до заполнения — чтобы видеть что за форма
+  await page.screenshot({ path: path.join(C.outDir, 'before_login.png') });
+
+  // Заполняем email
+  const emailField = page.locator('input[type="email"]').first();
+  await emailField.waitFor({ state: 'visible', timeout: 10000 });
+  await emailField.click();
+  await emailField.fill('');
+  await emailField.type(C.email, { delay: 50 });
+  log('Email введён');
+
+  // Заполняем пароль
+  const passField = page.locator('input[type="password"]').first();
+  await passField.click();
+  await passField.fill('');
+  await passField.type(C.password, { delay: 50 });
+  log('Пароль введён');
+
+  // Чекбокс "Eingeloggt bleiben"
+  try {
+    const cb = page.locator('input[type="checkbox"]').first();
+    if (await cb.isVisible({ timeout: 1000 })) {
+      await cb.check();
+      log('Чекбокс "остаться" активирован');
+    }
+  } catch (_) {}
+
+  // Кнопка "Log in" (точное название с сайта)
+  const submitBtn = page.locator('button[type="submit"]').first();
+  await submitBtn.waitFor({ state: 'visible', timeout: 5000 });
+  await submitBtn.click();
+  log('Кнопка Log in нажата');
+
+  // Ждём навигации — сайт на Livewire, редирект может быть медленным
+  await page.waitForTimeout(4000);
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(2000);
-  log('✅ Авторизован, URL:', page.url());
+
+  const currentUrl = page.url();
+  log('URL после логина:', currentUrl);
+
+  // Скриншот после логина
+  await page.screenshot({ path: path.join(C.outDir, 'after_login.png') });
+
+  // Проверяем успешность
+  if (currentUrl.includes('/login')) {
+    // Всё ещё на странице логина — проверяем текст ошибки
+    const bodyText = await page.locator('body').innerText().catch(() => '');
+    log('Текст страницы после логина (первые 300 симв):', bodyText.slice(0, 300));
+
+    // Может быть просто медленный Livewire редирект — ждём ещё
+    try {
+      await page.waitForURL(u => !u.includes('/login'), { timeout: 15000 });
+      log('✅ Редирект произошёл с задержкой, URL:', page.url());
+    } catch (_) {
+      // Проверяем — может пользователь залогинен но редиректа нет
+      const isLoggedIn = bodyText.includes('Abmelden') ||
+                         bodyText.includes('Logout') ||
+                         bodyText.includes('Mein Bereich') ||
+                         bodyText.includes('Wohnungsfinder') ||
+                         bodyText.includes('persönliche');
+      if (!isLoggedIn) {
+        throw new Error(`Логин не удался. URL: ${currentUrl}. Проверь email/пароль в Railway Variables.`);
+      }
+      log('✅ Залогинен (без редиректа, Livewire сессия)');
+    }
+  } else {
+    log('✅ Авторизован, редирект на:', currentUrl);
+  }
 }
 
 // ================================================================
-//  ПАРСИНГ — ПЕРЕХВАТ API + HTML FALLBACK
+//  ПАРСИНГ КВАРТИР
 // ================================================================
 async function scrape(page) {
   log('Загружаю wohnungsfinder...');
 
-  // Собираем ВСЕ JSON-ответы сети
+  // Перехватываем все JSON-ответы
   const captured = [];
   page.on('response', async (resp) => {
     try {
       const ct = resp.headers()['content-type'] || '';
-      if (!ct.includes('application/json')) return;
+      if (!ct.includes('application/json') && !ct.includes('text/json')) return;
       const url = resp.url();
       const json = await resp.json().catch(() => null);
       if (!json) return;
-      // Сохраняем всё — разберёмся потом
       captured.push({ url, json });
-      // Логируем все JSON эндпоинты для диагностики
-      log('JSON API:', url.slice(0, 100));
-      // Сохраняем каждый ответ отдельным файлом
-      const fname = 'api_' + url.replace(/[^a-z0-9]/gi, '_').slice(-40) + '.json';
+      log('JSON от:', url.slice(0, 100));
+      const fname = 'api_' + encodeURIComponent(url).slice(-50) + '.json';
       fs.writeFileSync(path.join(C.outDir, fname), JSON.stringify(json, null, 2));
     } catch (_) {}
   });
@@ -198,168 +272,212 @@ async function scrape(page) {
   await page.goto(C.finderUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await page.waitForTimeout(2000);
 
-  // Закрыть cookie-попап если появился
-  for (const s of ['button:has-text("Alle akzeptieren")', 'button:has-text("Speichern")']) {
+  // Закрыть cookie попап если появился снова
+  for (const s of ['text="Alle akzeptieren"', 'text="Speichern"']) {
     try {
       const b = page.locator(s).first();
       if (await b.isVisible({ timeout: 1500 })) { await b.click(); await page.waitForTimeout(800); }
     } catch (_) {}
   }
 
-  // Ждём загрузки контента
-  await page.waitForLoadState('networkidle', { timeout: 25000 }).catch(() => {});
-  await page.waitForTimeout(3000);
+  // Ждём полной загрузки (Livewire грузит данные после DOMContentLoaded)
+  await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+  await page.waitForTimeout(5000);
 
   // Скриншот
   const ssPath = path.join(C.outDir, 'results.png');
   await page.screenshot({ path: ssPath, fullPage: false });
 
-  // ── Шаг 1: пробуем данные из API ──
-  let apartments = [];
-  if (captured.length > 0) {
-    apartments = extractFromApi(captured);
-    log(`API: извлечено ${apartments.length} квартир из ${captured.length} JSON-ответов`);
+  // Сохраняем полный HTML для анализа
+  const html = await page.content();
+  fs.writeFileSync(path.join(C.outDir, 'finder.html'), html);
+
+  // ── Пробуем получить данные из Livewire snapshot в HTML ──
+  let apartments = extractFromLivewire(html);
+  if (apartments.length > 0) {
+    log(`Livewire snapshot: ${apartments.length} квартир`);
   }
 
-  // ── Шаг 2: если API не дал — парсим DOM ──
+  // ── Если Livewire не дал — пробуем JSON API ──
+  if (apartments.length === 0 && captured.length > 0) {
+    apartments = extractFromApi(captured);
+    log(`JSON API: ${apartments.length} квартир`);
+  }
+
+  // ── Если ничего — парсим DOM ──
   if (apartments.length === 0) {
-    log('API пустой, парсю DOM...');
+    log('Парсю DOM напрямую...');
     apartments = await extractFromDom(page);
-    log(`DOM: извлечено ${apartments.length} квартир`);
+    log(`DOM: ${apartments.length} квартир`);
   }
 
   // Дебаг первых 5
   apartments.slice(0, 5).forEach((a, i) =>
-    log(`[${i}] rooms=${a.rooms} rent=${a.rent}€ size=${a.size}m² addr=${a.address} url=${a.url.slice(0, 70)}`)
+    log(`[${i}] rooms=${a.rooms||'?'} rent=${a.rent||'?'}€ size=${a.size||'?'}m² ${a.address} | ${a.url.slice(0,70)}`)
   );
 
   return { apartments, ssPath };
 }
 
 // ================================================================
-//  ИЗВЛЕЧЕНИЕ ИЗ API
+//  ИЗВЛЕЧЕНИЕ ИЗ LIVEWIRE SNAPSHOT (данные прямо в HTML)
+// ================================================================
+function extractFromLivewire(html) {
+  const apartments = [];
+
+  try {
+    // Livewire хранит данные в wire:snapshot или window.livewire_snapshot
+    const patterns = [
+      /wire:snapshot="([^"]+)"/g,
+      /wire:initial-data="([^"]+)"/g,
+      /__livewire_data\s*=\s*({.+?});/gs,
+    ];
+
+    for (const rx of patterns) {
+      let m;
+      while ((m = rx.exec(html)) !== null) {
+        try {
+          const raw = m[1].replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, '&');
+          const data = JSON.parse(raw);
+          const items = findApartmentArray(data);
+          if (items.length > 0) {
+            log(`Livewire: найден массив ${items.length} элементов`);
+            for (const item of items) {
+              const apt = normalizeItem(item);
+              if (apt && passesFilter(apt)) apartments.push(apt);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+
+    // Также ищем JSON-блоки в скриптах
+    const scriptRx = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let sm;
+    while ((sm = scriptRx.exec(html)) !== null) {
+      const scriptContent = sm[1];
+      // Ищем массивы с полями квартир
+      const jsonRx = /(\[{.+?}\])/gs;
+      let jm;
+      while ((jm = jsonRx.exec(scriptContent)) !== null) {
+        try {
+          const arr = JSON.parse(jm[1]);
+          if (Array.isArray(arr) && arr.length > 0 && hasAptFields(arr[0])) {
+            log(`Script JSON: массив ${arr.length} элементов`);
+            for (const item of arr) {
+              const apt = normalizeItem(item);
+              if (apt && passesFilter(apt)) apartments.push(apt);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (e) {
+    log('Livewire parse error:', e.message);
+  }
+
+  return dedupe(apartments);
+}
+
+// ================================================================
+//  ИЗВЛЕЧЕНИЕ ИЗ API ОТВЕТОВ
 // ================================================================
 function extractFromApi(captured) {
   const result = [];
-
   for (const { url, json } of captured) {
-    const items = findArray(json);
+    const items = findApartmentArray(json);
     if (items.length === 0) continue;
-    log(`  Массив из ${url.slice(0, 60)}: ${items.length} элементов`);
-
+    log(`  API массив из ${url.slice(0,60)}: ${items.length} элементов`);
     for (const item of items) {
-      if (!item || typeof item !== 'object') continue;
       const apt = normalizeItem(item);
-      if (apt) result.push(apt);
+      if (apt && passesFilter(apt)) result.push(apt);
     }
   }
-
-  return dedupe(result.filter(passesFilter));
+  return dedupe(result);
 }
 
-// Рекурсивно ищем массив объектов похожих на квартиры
-function findArray(obj, depth = 0) {
-  if (depth > 5 || !obj || typeof obj !== 'object') return [];
-
-  if (Array.isArray(obj) && obj.length > 0) {
-    const first = obj[0];
-    if (first && typeof first === 'object' && hasAptFields(first)) return obj;
-  }
-
+function findApartmentArray(obj, depth = 0) {
+  if (depth > 6 || !obj || typeof obj !== 'object') return [];
+  if (Array.isArray(obj) && obj.length > 0 && hasAptFields(obj[0])) return obj;
   for (const key of Object.keys(obj)) {
-    if (Array.isArray(obj[key]) && obj[key].length > 0) {
-      const first = obj[key][0];
-      if (first && typeof first === 'object' && hasAptFields(first)) return obj[key];
-    }
-    const found = findArray(obj[key], depth + 1);
+    if (Array.isArray(obj[key]) && obj[key].length > 0 && hasAptFields(obj[key][0])) return obj[key];
+    const found = findApartmentArray(obj[key], depth + 1);
     if (found.length > 0) return found;
   }
   return [];
 }
 
 function hasAptFields(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
   const keys = Object.keys(o).join(' ').toLowerCase();
-  return keys.includes('rent') || keys.includes('miete') || keys.includes('zimmer') ||
-         keys.includes('rooms') || keys.includes('wohnfl') || keys.includes('price') ||
-         keys.includes('address') || keys.includes('strasse') || keys.includes('expose');
+  return (keys.includes('rent') || keys.includes('miete') || keys.includes('zimmer') ||
+          keys.includes('rooms') || keys.includes('wohnfl') || keys.includes('expose') ||
+          keys.includes('kaltmiete') || keys.includes('flaeche'));
 }
 
 function normalizeItem(item) {
-  // Все возможные поля немецкого API недвижимости
-  const rent = toFloat(
-    item.kaltmiete || item.kaltmiete_in_euro || item.rent || item.cold_rent ||
-    item.miete || item.price || item.gesamtmiete || item.warmmiete ||
-    item['kaltmiete-in-euro'] || 0
-  );
+  if (!item || typeof item !== 'object') return null;
 
-  const rooms = toFloat(
-    item.zimmer || item.zimmeranzahl || item.rooms || item.room_count ||
-    item.anzahl_zimmer || item['anzahl-zimmer'] || item.zimmeranzahl_gesamt || 0
-  );
+  const rent = toFloat(item.kaltmiete || item.kaltmiete_in_euro || item['kaltmiete-in-euro'] ||
+    item.rent || item.cold_rent || item.miete || item.price || item.gesamtmiete || 0);
 
-  const size = toFloat(
-    item.wohnflaeche || item.flaeche || item.size || item.area ||
-    item.wohnfl || item['wohn-flaeche'] || item.living_area || 0
-  );
+  const rooms = toFloat(item.zimmer || item.zimmeranzahl || item['anzahl-zimmer'] ||
+    item.rooms || item.room_count || item.anzahl_zimmer || 0);
 
-  // URL объекта
+  const size = toFloat(item.wohnflaeche || item['wohn-flaeche'] || item.flaeche ||
+    item.size || item.area || item.living_area || 0);
+
   let url = item.url || item.link || item.href || item.expose_url ||
             item.detail_url || item.object_url || item.deeplink || '';
   if (url && !url.startsWith('http')) url = C.baseUrl + (url.startsWith('/') ? '' : '/') + url;
-  if (!url && (item.id || item.expose_id || item.objekt_id)) {
-    const id = item.id || item.expose_id || item.objekt_id;
-    url = `${C.baseUrl}/wohnungsfinder/?objekt=${id}`;
+  if (!url) {
+    const id = item.id || item.expose_id || item.objekt_id || item.object_id;
+    if (id) url = `${C.baseUrl}/wohnungsfinder/?objekt=${id}`;
+    else url = C.finderUrl;
   }
-  if (!url) url = C.finderUrl;
 
   const id = String(item.id || item.expose_id || item.objekt_id || item.object_id || url);
-
-  const address = [
-    item.strasse || item.street || item.adresse || item.address || '',
-    item.hausnummer || item.house_number || '',
-  ].filter(Boolean).join(' ').trim() || item.standort || item.location || '';
+  const address = [item.strasse || item.street || item.adresse || item.address || '',
+                   item.hausnummer || item.house_number || ''].filter(Boolean).join(' ').trim()
+                || item.standort || item.location || '';
 
   return {
-    id,
-    url,
+    id, url,
     title:    item.titel || item.title || item.bezeichnung || item.name || '',
     address,
-    district: item.bezirk || item.district || item.stadtteil || item.ortsteil ||
-              item.stadtbezirk || item.neighbourhood || '',
-    company:  item.gesellschaft || item.company || item.anbieter ||
-              item.unternehmen || item.provider || '',
+    district: item.bezirk || item.district || item.stadtteil || item.ortsteil || item.stadtbezirk || '',
+    company:  item.gesellschaft || item.company || item.anbieter || item.unternehmen || '',
     rent:     rent  > 0 ? rent.toFixed(2)  : '',
     rooms:    rooms > 0 ? String(rooms)    : '',
     size:     size  > 0 ? String(size)     : '',
-    wbs:      item.wbs || item.wbs_required || item.wbs_typ || '',
+    wbs:      String(item.wbs || item.wbs_required || item.wbs_typ || ''),
   };
 }
 
 // ================================================================
-//  ИЗВЛЕЧЕНИЕ ИЗ DOM (запасной)
+//  ИЗВЛЕЧЕНИЕ ИЗ DOM
 // ================================================================
 async function extractFromDom(page) {
-  // Сохраняем HTML для анализа
-  const html = await page.content();
-  fs.writeFileSync(path.join(C.outDir, 'page.html'), html);
-
   const result = [];
 
-  // Пробуем разные селекторы карточек
+  // Пробуем найти карточки
   const selectors = [
-    '[class*="result"]', '[class*="Result"]',
-    '[class*="apartment"]', '[class*="Apartment"]',
-    '[class*="wohnung"]', '[class*="Wohnung"]',
-    '[class*="listing"]', '[class*="card"]',
-    'article', 'li[class]',
+    '[wire\\:key]',          // Livewire элементы
+    '[class*="result"]',
+    '[class*="apartment"]',
+    '[class*="wohnung"]',
+    '[class*="listing"]',
+    '[class*="card"]',
+    'article',
+    'li[class]',
   ];
 
   let locator = null;
   for (const sel of selectors) {
     try {
       const count = await page.locator(sel).count();
-      if (count >= 3 && count <= 100) {
-        log(`DOM селектор "${sel}": ${count} элементов`);
+      if (count >= 3 && count <= 200) {
+        log(`DOM: селектор "${sel}" → ${count} элементов`);
         locator = page.locator(sel);
         break;
       }
@@ -367,15 +485,14 @@ async function extractFromDom(page) {
   }
 
   if (!locator) {
-    log('Карточки не найдены, пробую по ссылкам...');
+    log('DOM: карточки не найдены, парсю по ссылкам');
     return extractByLinks(page);
   }
 
   const count = await locator.count();
   for (let i = 0; i < count; i++) {
     try {
-      const card = locator.nth(i);
-      const apt  = await parseCard(card);
+      const apt = await parseCard(locator.nth(i));
       if (apt && passesFilter(apt)) result.push(apt);
     } catch (_) {}
   }
@@ -387,47 +504,43 @@ async function parseCard(card) {
   const text = await card.innerText().catch(() => '');
   if (!text || text.trim().length < 10) return null;
 
-  // Ищем ссылку на объект внутри карточки
+  // Ищем ссылку
   let url = C.finderUrl;
   try {
-    const allLinks = await card.locator('a[href]').all();
-    for (const link of allLinks) {
+    const links = await card.locator('a[href]').all();
+    for (const link of links) {
       const href = (await link.getAttribute('href') || '').trim();
       if (!href || href === '#') continue;
-      // Приоритет: ссылки с ID объекта или ключевыми словами
       if (href.match(/\d{4,}/) || href.includes('expose') || href.includes('objekt') ||
           href.includes('wohnung') || href.includes('apartment')) {
         url = href.startsWith('http') ? href : C.baseUrl + href;
         break;
       }
     }
-    // Если не нашли специфичную — берём первую ссылку
-    if (url === C.finderUrl && allLinks.length > 0) {
-      const href = (await allLinks[0].getAttribute('href') || '').trim();
+    if (url === C.finderUrl && links.length > 0) {
+      const href = (await links[0].getAttribute('href') || '').trim();
       if (href && href !== '#') url = href.startsWith('http') ? href : C.baseUrl + href;
     }
   } catch (_) {}
 
-  // Парсим числа из текста карточки
-  // Комнаты: "3 Zimmer", "3-Zimmer", "Zi.: 3", "3 Zi."
-  const rooms = extractNum(text, /(\d+(?:[.,]\d+)?)\s*(?:Zimmer|Zi\.|Zi\b)/i)
+  // Комнаты — несколько паттернов
+  const rooms = extractNum(text, /(\d+(?:[.,]\d+)?)\s*Zimmer/i)
              || extractNum(text, /(\d+(?:[.,]\d+)?)-Zimmer/i)
-             || extractNum(text, /(?:Zimmer|Zi\.)[:\s]*(\d+(?:[.,]\d+)?)/i);
+             || extractNum(text, /Zimmer[:\s]+(\d+(?:[.,]\d+)?)/i)
+             || extractNum(text, /(\d+(?:[.,]\d+)?)\s*Zi\b/i);
 
-  // Аренда: "466,94 €", "466.94 €", "466 €" — но не дробные копейки типа "1.38"
-  // Ищем числа от 100 до 9999 перед знаком €
-  const rentMatch = text.match(/(\d{3,4}(?:[.,]\d{1,2})?)\s*€/);
+  // Аренда — только реалистичные суммы (100-9999 €)
+  const rentMatch = text.match(/\b(\d{3,4}(?:[,.]?\d{0,2})?)\s*€/);
   const rent = rentMatch ? toFloat(rentMatch[1]) : null;
 
-  // Площадь: "70,28 m²", "70 qm"
+  // Площадь
   const size = extractNum(text, /(\d+(?:[.,]\d+)?)\s*m²/i)
             || extractNum(text, /(\d+(?:[.,]\d+)?)\s*qm/i);
 
-  const id = url !== C.finderUrl ? url : `apt_${rent}_${rooms}_${size}_${text.slice(0,20).trim()}`;
+  const id = url !== C.finderUrl ? url : `dom_${rent}_${rooms}_${text.slice(0,25).trim()}`;
 
   return {
-    id,
-    url,
+    id, url,
     title:    '',
     address:  extractAddress(text),
     district: extractDistrict(text),
@@ -435,13 +548,13 @@ async function parseCard(card) {
     rent:     rent  != null ? rent.toFixed(2)  : '',
     rooms:    rooms != null ? String(rooms)    : '',
     size:     size  != null ? String(size)     : '',
-    wbs:      /WBS/i.test(text) ? 'Требуется WBS' : '',
+    wbs:      /\bWBS\b/i.test(text) ? 'Требуется WBS' : '',
   };
 }
 
 async function extractByLinks(page) {
   const result = [];
-  const links  = await page.locator('a[href]').all();
+  const links = await page.locator('a[href]').all();
 
   for (const link of links) {
     try {
@@ -452,21 +565,20 @@ async function extractByLinks(page) {
       const fullUrl = href.startsWith('http') ? href : C.baseUrl + href;
       if (result.find(a => a.id === fullUrl)) continue;
 
-      // Берём текст из родителей (до 5 уровней вверх)
       const parentText = await link.evaluate(el => {
         let node = el;
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 6; i++) {
           node = node.parentElement;
           if (!node) break;
-          const t = node.innerText || '';
+          const t = (node.innerText || '').trim();
           if (t.includes('€') && t.length > 30) return t;
         }
-        return el.innerText || '';
+        return (el.innerText || '').trim();
       }).catch(() => '');
 
-      const rentMatch = parentText.match(/(\d{3,4}(?:[.,]\d{1,2})?)\s*€/);
+      const rentMatch = parentText.match(/\b(\d{3,4}(?:[,.]?\d{0,2})?)\s*€/);
       const rent  = rentMatch ? toFloat(rentMatch[1]) : null;
-      const rooms = extractNum(parentText, /(\d+(?:[.,]\d+)?)\s*(?:Zimmer|Zi\.|Zi\b)/i)
+      const rooms = extractNum(parentText, /(\d+(?:[.,]\d+)?)\s*Zimmer/i)
                  || extractNum(parentText, /(\d+(?:[.,]\d+)?)-Zimmer/i);
       const size  = extractNum(parentText, /(\d+(?:[.,]\d+)?)\s*m²/i);
 
@@ -478,7 +590,7 @@ async function extractByLinks(page) {
         rent:     rent  != null ? rent.toFixed(2)  : '',
         rooms:    rooms != null ? String(rooms)    : '',
         size:     size  != null ? String(size)     : '',
-        wbs:      /WBS/i.test(parentText) ? 'Требуется WBS' : '',
+        wbs:      /\bWBS\b/i.test(parentText) ? 'Требуется WBS' : '',
       });
     } catch (_) {}
   }
@@ -487,7 +599,7 @@ async function extractByLinks(page) {
 }
 
 // ================================================================
-//  ВСПОМОГАЛКИ
+//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ================================================================
 function toFloat(v) {
   if (!v && v !== 0) return 0;
@@ -507,10 +619,10 @@ function extractAddress(text) {
 function extractDistrict(text) {
   const list = [
     'Mitte','Tiergarten','Wedding','Prenzlauer Berg','Friedrichshain','Kreuzberg',
-    'Pankow','Weißensee','Heinersdorf','Buchholz','Charlottenburg','Wilmersdorf',
-    'Spandau','Steglitz','Zehlendorf','Tempelhof','Schöneberg','Neukölln',
-    'Treptow','Köpenick','Marzahn','Hellersdorf','Lichtenberg','Hohenschönhausen',
-    'Reinickendorf','Wittenau','Tegel','Buch','Niederschöneweide','Adlershof',
+    'Pankow','Weißensee','Heinersdorf','Charlottenburg','Wilmersdorf','Spandau',
+    'Steglitz','Zehlendorf','Tempelhof','Schöneberg','Neukölln','Treptow',
+    'Köpenick','Marzahn','Hellersdorf','Lichtenberg','Hohenschönhausen',
+    'Reinickendorf','Wittenau','Tegel','Buch','Adlershof',
   ];
   for (const d of list) { if (text.includes(d)) return d; }
   return '';
@@ -556,8 +668,9 @@ async function runCheck() {
       });
     }
 
-    ctx  = await browser.newContext({
-      locale: 'de-DE', timezoneId: 'Europe/Berlin',
+    ctx = await browser.newContext({
+      locale: 'de-DE',
+      timezoneId: 'Europe/Berlin',
       viewport: { width: 1280, height: 900 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
     });
@@ -607,7 +720,7 @@ async function runCheck() {
       await sleep(700);
     }
 
-    // Изменилось количество
+    // Изменилось количество без совпадений по ID
     if (!STATE.firstRun && STATE.lastCount !== null &&
         STATE.lastCount !== apartments.length &&
         added.length === 0 && removed.length === 0) {
@@ -622,8 +735,13 @@ async function runCheck() {
   } catch (e) {
     errCount++;
     log('ОШИБКА:', e.message);
-    if (errCount <= 3) await tgText(`⚠️ Ошибка #${errCount}:\n<code>${e.message}</code>`).catch(() => {});
-    if (errCount % 3 === 0) { try { await browser?.close(); } catch (_) {} browser = null; }
+    if (errCount <= 3) {
+      await tgText(`⚠️ Ошибка #${errCount}:\n<code>${e.message}</code>`).catch(() => {});
+    }
+    if (errCount % 3 === 0) {
+      try { await browser?.close(); } catch (_) {}
+      browser = null;
+    }
   } finally {
     try { if (page) await page.close(); } catch (_) {}
     try { if (ctx)  await ctx.close();  } catch (_) {}
