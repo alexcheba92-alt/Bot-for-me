@@ -14,7 +14,9 @@ let seen = new Set();
 
 function loadSeen() {
     try {
-        if (fs.existsSync(SEEN_FILE)) seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
+        if (fs.existsSync(SEEN_FILE)) {
+            seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
+        }
     } catch (e) {}
 }
 
@@ -24,7 +26,9 @@ function saveSeen() {
 
 async function sendTelegram(text, url = null) {
     const payload = { chat_id: TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' };
-    if (url) payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
+    if (url) {
+        payload.reply_markup = { inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]] };
+    }
     try {
         await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload);
         console.log('✅ Telegram OK');
@@ -50,28 +54,28 @@ async function checkApartments() {
         }
 
         await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForTimeout(10000);
+        await page.waitForTimeout(12000);
 
-        // Фильтры + кнопка
+        // Фильтры
         await page.locator('input[name*="miete_bis"], input[placeholder*="Kaltmiete"]').last().fill('600').catch(() => {});
         await page.locator('input[name*="zimmer"]').first().fill('3').catch(() => {});
         await page.locator('button:has-text("Wohnung suchen"), button[type="submit"]').click().catch(() => {});
-        await page.waitForTimeout(15000); // очень важная длинная пауза
+        await page.waitForTimeout(15000);
 
-        // Максимально агрессивный сбор всех возможных ссылок
+        // Очень агрессивный парсинг
         const apartments = await page.evaluate(() => {
-            const results = [];
-            document.querySelectorAll('a, [href]').forEach(el => {
-                const href = (el.href || el.getAttribute('href') || '').trim();
-                const text = (el.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
+            const results = new Set();
+            document.querySelectorAll('a').forEach(a => {
+                const href = a.href.trim();
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
                 if (href && href.length > 50 && 
                     (href.includes('/expose/') || 
-                     href.includes('howoge') || href.includes('gewobag') || 
-                     href.includes('degewo') || href.includes('stadtundland'))) {
-                    results.push({ href, text });
+                     href.includes('howoge.de') || href.includes('gewobag.de') || 
+                     href.includes('degewo.de') || href.includes('stadtundland.de'))) {
+                    results.add(href);
                 }
             });
-            return results;
+            return Array.from(results).map(href => ({ href, text: 'Квартира' }));
         });
 
         console.log(`Найдено потенциальных ссылок: ${apartments.length}`);
@@ -90,8 +94,7 @@ async function checkApartments() {
                     await sendTelegram(
                         `🚨 <b>НОВАЯ КВАРТИРА!</b> 🏠\n\n` +
                         `🕒 ${time}\n` +
-                        `🔗 ${apt.href}\n\n` +
-                        `📝 ${apt.text}...`,
+                        `🔗 ${apt.href}`,
                         apt.href
                     );
                 }
