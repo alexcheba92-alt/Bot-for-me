@@ -53,14 +53,20 @@ async function checkApartments() {
         await page.waitForTimeout(30000); // очень длинная пауза
 
         await page.screenshot({ path: '/tmp/last_page.png' });
-        console.log('✅ Скриншот сохранён');
+        console.log('✅ Скриншот сохранён (/tmp/last_page.png)');
 
+        // Максимально агрессивный сбор
         const apartments = await page.evaluate(() => {
             const results = [];
-            document.querySelectorAll('a').forEach(a => {
+            document.querySelectorAll('a[href]').forEach(a => {
                 const href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
-                if (href.length > 50 && (href.includes('/expose/') || href.includes('howoge') || href.includes('gewobag') || href.includes('degewo') || href.includes('stadtundland'))) {
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
+                if (href.length > 50 && 
+                    (href.includes('/expose/') || 
+                     href.includes('howoge') || 
+                     href.includes('gewobag') || 
+                     href.includes('degewo') || 
+                     href.includes('stadtundland'))) {
                     results.push({ href, text });
                 }
             });
