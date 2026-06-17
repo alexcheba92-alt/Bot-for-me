@@ -31,10 +31,10 @@ const path     = require('path');
 //  КОНФИГ
 // ================================================================
 const C = {
-  email:      process.env.IBW_EMAIL    || '',
-  password:   process.env.IBW_PASSWORD || '',
-  tgToken:    process.env.TG_TOKEN     || '',
-  tgChatId:   process.env.TG_CHAT_ID   || '',
+  email:      process.env.INBERLIN_EMAIL    || '',
+  password:   process.env.INBERLIN_PASSWORD || '',
+  tgToken:    process.env.TELEGRAM_TOKEN     || '',
+  tgChatId:   process.env.TELEGRAM_CHAT_ID   || '',
 
   // Фильтры поиска
   maxRent:    600,   // Kaltmiete €
@@ -58,14 +58,14 @@ if (!fs.existsSync(C.outDir)) fs.mkdirSync(C.outDir, { recursive: true });
 // Проверка конфига при старте
 function checkConfig() {
   const missing = [];
-  if (!C.email)    missing.push('IBW_EMAIL');
-  if (!C.password) missing.push('IBW_PASSWORD');
-  if (!C.tgToken)  missing.push('TG_TOKEN');
-  if (!C.tgChatId) missing.push('TG_CHAT_ID');
+  if (!C.email)    missing.push('INBERLIN_EMAIL');
+  if (!C.password) missing.push('INBERLIN_PASSWORD');
+  if (!C.tgToken)  missing.push('TELEGRAM_TOKEN');
+  if (!C.tgChatId) missing.push('TELEGRAM_CHAT_ID');
   if (missing.length) {
     console.error('\n❌ Не заполнены переменные в .env файле:');
     missing.forEach(k => console.error(`   ${k}`));
-    console.error('\nСкопируй .env.example в .env и заполни значения.\n');
+    console.error('\nЗаполни переменные в Railway → Variables.\n');
     process.exit(1);
   }
 }
