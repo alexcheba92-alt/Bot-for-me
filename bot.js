@@ -50,12 +50,12 @@ async function checkApartments() {
         }
 
         await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 120000 });
-        await page.waitForTimeout(30000); // очень длинная пауза
+        await page.waitForTimeout(30000); // длинная пауза
 
         await page.screenshot({ path: '/tmp/last_page.png' });
-        console.log('✅ Скриншот сохранён (/tmp/last_page.png)');
+        console.log('✅ Скриншот сохранён');
 
-        // Максимально агрессивный сбор
+        // Максимально агрессивный парсинг
         const apartments = await page.evaluate(() => {
             const results = [];
             document.querySelectorAll('a[href]').forEach(a => {
@@ -63,10 +63,9 @@ async function checkApartments() {
                 const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
                 if (href.length > 50 && 
                     (href.includes('/expose/') || 
-                     href.includes('howoge') || 
-                     href.includes('gewobag') || 
-                     href.includes('degewo') || 
-                     href.includes('stadtundland'))) {
+                     href.includes('howoge') || href.includes('gewobag') || 
+                     href.includes('degewo') || href.includes('stadtundland') || 
+                     href.includes('wohnung') || href.includes('immobilie'))) {
                     results.push({ href, text });
                 }
             });
