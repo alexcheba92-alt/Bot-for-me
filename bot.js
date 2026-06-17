@@ -14,9 +14,7 @@ let seen = new Set();
 
 function loadSeen() {
     try {
-        if (fs.existsSync(SEEN_FILE)) {
-            seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
-        }
+        if (fs.existsSync(SEEN_FILE)) seen = new Set(JSON.parse(fs.readFileSync(SEEN_FILE, 'utf8')));
     } catch (e) {}
 }
 
@@ -38,10 +36,7 @@ async function checkApartments() {
     console.log(`[${now}] Запуск проверки...`);
 
     const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-    const page = await browser.newContext({ 
-        ...devices['iPhone 13 Pro'], 
-        locale: 'de-DE' 
-    }).then(c => c.newPage());
+    const page = await browser.newContext({ ...devices['iPhone 13 Pro'], locale: 'de-DE' }).then(c => c.newPage());
 
     try {
         await page.goto('https://www.inberlinwohnen.de/login/', { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -54,17 +49,17 @@ async function checkApartments() {
             await page.waitForTimeout(8000);
         }
 
-        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'domcontentloaded', timeout: 90000 });
-        await page.waitForTimeout(25000); // длинная пауза
+        await page.goto('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/', { waitUntil: 'networkidle', timeout: 120000 });
+        await page.waitForTimeout(30000); // очень длинная пауза
 
         await page.screenshot({ path: '/tmp/last_page.png' });
-        console.log('✅ Скриншот сохранён (/tmp/last_page.png)');
+        console.log('✅ Скриншот сохранён');
 
         const apartments = await page.evaluate(() => {
             const results = [];
-            document.querySelectorAll('a[href]').forEach(a => {
+            document.querySelectorAll('a').forEach(a => {
                 const href = a.href.trim();
-                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 120);
+                const text = (a.textContent || '').trim().replace(/\s+/g, ' ').substring(0, 100);
                 if (href.length > 50 && (href.includes('/expose/') || href.includes('howoge') || href.includes('gewobag') || href.includes('degewo') || href.includes('stadtundland'))) {
                     results.push({ href, text });
                 }
@@ -115,7 +110,7 @@ async function checkApartments() {
 async function main() {
     loadSeen();
     console.log('🤖 Бот запущен');
-    await sendTelegram('🤖 Бот перезапущен. Пытаюсь ловить...');
+    await sendTelegram('🤖 Бот перезапущен.');
 
     await checkApartments();
     setInterval(checkApartments, CHECK_INTERVAL);
