@@ -1,61 +1,33 @@
-'use strict';
-const axios = require('axios');
-const tough = require('tough-cookie');
-const { wrapper } = require('axios-cookiejar-support');
-const cheerio = require('cheerio');
-const qs = require('qs');
-
-// Инициализация HTTP-клиента
-const jar = new tough.CookieJar();
-const client = wrapper(axios.create({
-    jar,
-    withCredentials: true,
-    timeout: 15000,
-    headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    }
-}));
-
 async function runService() {
-    console.log("Бот запущен в HTTP-режиме...");
+    console.log("Попытка входа...");
     try {
-        // 1. Получаем логин-страницу
+        // 1. Обязательно забираем свежие куки и токен
         const loginPage = await client.get('https://www.inberlinwohnen.de/login/');
         const $ = cheerio.load(loginPage.data);
-        const csrf = $('input[name="csrf_token"]').attr('value') || $('input[name="_token"]').attr('value');
+        const csrfToken = $('input[name="_token"]').val(); // Проверь в HTML, может быть csrf_token
+        
+        console.log("CSRF Токен получен:", csrfToken ? "ОК" : "ПУСТО");
 
-        // 2. Логин
-        await client.post('https://www.inberlinwohnen.de/login/', qs.stringify({
+        // 2. Отправляем логин с правильными заголовками
+        const loginRes = await client.post('https://www.inberlinwohnen.de/login/', qs.stringify({
             email: process.env.INBERLIN_EMAIL,
             password: process.env.INBERLIN_PASSWORD,
-            csrf_token: csrf
+            _token: csrfToken // Если упадет с 419, попробуй поменять на csrf_token
         }), {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+            headers: { 
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': 'https://www.inberlinwohnen.de/login/'
+            }
         });
 
-        // 3. Получение квартир
+        console.log("Логин статус:", loginRes.status);
+
+        // 3. Сразу идем во Finder
         const finder = await client.get('https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder/');
-        const $$ = cheerio.load(finder.data);
-        const links = [];
-        $$('a[href*="/expose/"]').each((_, el) => { links.push($$(el).attr('href')); });
-
-        console.log('Найдено квартир:', links.length);
-        if (links.length > 0) {
-             // Здесь ты можешь добавить вызов sendTelegram
-             console.log('Первая ссылка:', links[0]);
-        }
+        console.log("Статус страницы поиска:", finder.status);
+        
+        // ... парсинг ссылок
     } catch (e) {
-        console.error('Ошибка в работе:', e.message);
+        console.error("Ошибка в работе:", e.message);
     }
 }
-
-// Запуск бесконечного цикла
-async function main() {
-    while(true) {
-        await runService();
-        await new Promise(r => setTimeout(r, 300000)); // 5 минут
-    }
-}
-
-main();
