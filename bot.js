@@ -14,9 +14,12 @@ const CHECK_INTERVAL = 5 * 60 * 1000;
 const STATE_FILE = '/tmp/inberlin_state.json';
 const DEBUG_DIR = '/tmp/inberlin_debug';
 
-let state = { seen: [], firstRun: true };
+let state = {
+  seen: [],
+  firstRun: true
+};
 
-function ensureDebugDir() {
+function ensureDirs() {
   if (!fs.existsSync(DEBUG_DIR)) fs.mkdirSync(DEBUG_DIR, { recursive: true });
 }
 
@@ -56,8 +59,9 @@ function escapeHtml(s = '') {
 }
 
 function isBadLink(href) {
-  const h = href.toLowerCase();
+  const h = String(href || '').toLowerCase();
   return (
+    !h ||
     h === 'https://www.inberlinwohnen.de' ||
     h === 'https://www.inberlinwohnen.de/' ||
     h.includes('/datenschutz') ||
@@ -67,8 +71,10 @@ function isBadLink(href) {
     h.includes('/wohnungsfinder') ||
     h.includes('/wohnungstausch') ||
     h.includes('/wohnungsvergabe') ||
+    h.includes('/mein-bereich') ||
     h.endsWith('#') ||
-    h.includes('mailto:')
+    h.includes('mailto:') ||
+    h.includes('javascript:')
   );
 }
 
@@ -79,11 +85,13 @@ async function sendTelegram(text, url = null) {
     parse_mode: 'HTML',
     disable_web_page_preview: true
   };
+
   if (url) {
     payload.reply_markup = {
       inline_keyboard: [[{ text: '🔗 Открыть квартиру', url }]]
     };
   }
+
   await axios.post(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, payload, {
     timeout: 30000
   });
@@ -115,45 +123,98 @@ async function openFinder(page) {
   await page.waitForTimeout(6000);
 }
 
+async function dumpDebug(page) {
+  ensureDirs();
+  const html = await page.content();
+  fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), html);
+  await page.screenshot({ path: path.join(DEBUG_DIR, 'last.png'), fullPage: true }).catch(() => {});
+  const signals = await page.evaluate(() => {
+    const arr = Array.from(document.querySelectorAll('body *'))
+      .map(el => (el.innerText || '').replace(/\s+/g, ' ').trim())
+      .filter(t => t.length > 25)
+      .filter(t => /zimmer|qm|m²|€|euro|kaltmiete|warmmiete|bezirk|wohnung|angebot|expose/i.test(t))
+      .slice(0, 100);
+    return arr;
+  });
+  fs.writeFileSync(path.join(DEBUG_DIR, 'signals.json'), JSON.stringify(signals, null, 2));
+}
+
 async function extractListings(page) {
-  return await page.evaluate((isBadLinkFnSource) => {
-    const isBadLink = new Function(`return (${isBadLinkFnSource})`)();
+  return await page.evaluate((badLinkFnStr) => {
+    const isBadLink = new Function(`return (${badLinkFnStr})`)();
 
     const textScore = (t) => {
       let score = 0;
-      if (/€|euro|kaltmiete|warmmiete/i.test(t)) score += 2;
-      if (/zimmer|qm|m²/i.test(t)) score += 2;
-      if (/bezirk|berlin|wohnung|angebot|expose/i.test(t)) score += 1;
+      if (/€|euro|kaltmiete|warmmiete/i.test(t)) score += 3;
+      if (/zimmer|qm|m²/i.test(t)) score += 3;
+      if (/bezirk|berlin/i.test(t)) score += 1;
+      if (/wohnung|angebot|expose/i.test(t)) score += 2;
       return score;
     };
+
+    const candidates = [];
+    const selectors = [
+      'article',
+      'li',
+      '.card',
+      '.result',
+      '.listing',
+      '.listing-item',
+      '.offer',
+      '.angebot',
+      'div'
+    ];
+
+    for (const sel of selectors) {
+      candidates.push(...Array.from(document.querySelectorAll(sel)));
+    }
 
     const out = [];
     const seen = new Set();
 
-    const nodes = Array.from(document.querySelectorAll('article, li, .card, .result, .listing, .listing-item, .offer, .angebot, div'));
-    for (const node of nodes) {
+    for (const node of candidates) {
       const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-      if (!text || text.length < 20) continue;
-      if (textScore(text) < 3) continue;
+      if (!text || text.length < 30) continue;
+
+      const score = textScore(text);
+      if (score < 5) continue;
 
       const links = Array.from(node.querySelectorAll('a[href]'));
-      const link = links.find(a => {
+      const good = links.find(a => {
         const href = (a.href || '').trim();
-        if (!href) return false;
         if (isBadLink(href)) return false;
         if (!href.includes('inberlinwohnen.de')) return false;
         return true;
       });
 
-      if (!link) continue;
+      if (!good) continue;
 
-      const href = link.href.replace(/\/$/, '').split('?')[0];
+      const href = good.href.replace(/\/$/, '').split('?')[0];
       if (seen.has(href)) continue;
       seen.add(href);
 
       out.push({
         href,
-        text: text.slice(0, 500)
+        text: text.slice(0, 600)
+      });
+    }
+
+    const simpleAnchors = Array.from(document.querySelectorAll('a[href]'))
+      .map(a => ({
+        href: (a.href || '').trim(),
+        text: (a.innerText || a.textContent || '').replace(/\s+/g, ' ').trim()
+      }))
+      .filter(x => !isBadLink(x.href))
+      .filter(x => x.href.includes('inberlinwohnen.de'))
+      .filter(x => /€|euro|kaltmiete|warmmiete|zimmer|qm|m²|wohnung|angebot|expose/i.test(x.text));
+
+    for (const a of simpleAnchors) {
+      const href = a.href.replace(/\/$/, '').split('?')[0];
+      if (seen.has(href)) continue;
+      seen.add(href);
+      out.push({
+        href,
+        text: a.text.slice(0, 600)
       });
     }
 
@@ -162,23 +223,29 @@ async function extractListings(page) {
 }
 
 function formatListing(item) {
-  const firstLine = item.text.split('\n')[0].slice(0, 140);
-  return `• <b>${escapeHtml(firstLine)}</b>\n${escapeHtml(item.text)}\n${escapeHtml(item.href)}`;
+  const title = (item.text.split('\n')[0] || item.href).slice(0, 140);
+  return `• <b>${escapeHtml(title)}</b>\n${escapeHtml(item.text)}\n${escapeHtml(item.href)}`;
 }
 
 async function checkApartments() {
-  ensureDebugDir();
+  ensureDirs();
 
-  const browser = await chromium.launch({ headless: true, args: ['--no-sandbox'] });
-  const context = await browser.newContext({ ...devices['iPhone 13 Pro'], locale: 'de-DE' });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox']
+  });
+
+  const context = await browser.newContext({
+    ...devices['iPhone 13 Pro'],
+    locale: 'de-DE'
+  });
+
   const page = await context.newPage();
 
   try {
     await login(page);
     await openFinder(page);
-
-    fs.writeFileSync(path.join(DEBUG_DIR, 'last.html'), await page.content());
-    await page.screenshot({ path: path.join(DEBUG_DIR, 'last.png'), fullPage: true }).catch(() => {});
+    await dumpDebug(page);
 
     const listings = await extractListings(page);
     const current = listings.map(x => normalizeUrl(x.href));
