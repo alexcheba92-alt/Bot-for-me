@@ -424,6 +424,92 @@ async function parseByText(html, page) {
 }
 
 // ================================================================
+//  LIVEWIRE + API ИЗВЛЕЧЕНИЕ
+// ================================================================
+function extractFromLivewire(html) {
+  const apartments = [];
+  try {
+    const patterns = [
+      /wire:snapshot="([^"]+)"/g,
+      /wire:initial-data="([^"]+)"/g,
+    ];
+    for (const rx of patterns) {
+      let m;
+      while ((m = rx.exec(html)) !== null) {
+        try {
+          const raw = m[1].replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, '&');
+          const data = JSON.parse(raw);
+          const items = findApartmentArray(data);
+          for (const item of items) {
+            const apt = normalizeItem(item);
+            if (apt && passesFilter(apt)) apartments.push(apt);
+          }
+        } catch (_) {}
+      }
+    }
+    // JSON в script тегах
+    const scriptRx = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    let sm;
+    while ((sm = scriptRx.exec(html)) !== null) {
+      const jsonRx = /(\[{.+?}\])/gs;
+      let jm;
+      while ((jm = jsonRx.exec(sm[1])) !== null) {
+        try {
+          const arr = JSON.parse(jm[1]);
+          if (Array.isArray(arr) && arr.length > 0 && hasAptFields(arr[0])) {
+            for (const item of arr) {
+              const apt = normalizeItem(item);
+              if (apt && passesFilter(apt)) apartments.push(apt);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+  } catch (e) { log('Livewire parse error:', e.message); }
+  return dedupe(apartments);
+}
+
+function findApartmentArray(obj, depth = 0) {
+  if (depth > 6 || !obj || typeof obj !== 'object') return [];
+  if (Array.isArray(obj) && obj.length > 0 && hasAptFields(obj[0])) return obj;
+  for (const key of Object.keys(obj)) {
+    if (Array.isArray(obj[key]) && obj[key].length > 0 && hasAptFields(obj[key][0])) return obj[key];
+    const found = findApartmentArray(obj[key], depth + 1);
+    if (found.length > 0) return found;
+  }
+  return [];
+}
+
+function hasAptFields(o) {
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+  const keys = Object.keys(o).join(' ').toLowerCase();
+  return keys.includes('rent') || keys.includes('miete') || keys.includes('zimmer') ||
+         keys.includes('rooms') || keys.includes('wohnfl') || keys.includes('expose') ||
+         keys.includes('kaltmiete') || keys.includes('flaeche');
+}
+
+function normalizeItem(item) {
+  if (!item || typeof item !== 'object') return null;
+  const rent  = toFloat(item.kaltmiete || item.kaltmiete_in_euro || item['kaltmiete-in-euro'] || item.rent || item.cold_rent || item.miete || item.price || 0);
+  const rooms = toFloat(item.zimmer || item.zimmeranzahl || item['anzahl-zimmer'] || item.rooms || item.room_count || 0);
+  const size  = toFloat(item.wohnflaeche || item['wohn-flaeche'] || item.flaeche || item.size || item.area || 0);
+  let url = item.url || item.link || item.href || item.expose_url || item.detail_url || '';
+  if (url && !url.startsWith('http')) url = C.baseUrl + (url.startsWith('/') ? '' : '/') + url;
+  if (!url) { const id = item.id || item.expose_id || item.objekt_id; if (id) url = C.baseUrl + '/wohnungsfinder/?objekt=' + id; else url = C.finderUrl; }
+  const id = String(item.id || item.expose_id || item.objekt_id || url);
+  const address = [item.strasse || item.street || item.adresse || item.address || '', item.hausnummer || ''].filter(Boolean).join(' ').trim() || item.standort || '';
+  return {
+    id, url, title: item.titel || item.title || item.bezeichnung || '',
+    address, district: item.bezirk || item.district || item.stadtteil || item.ortsteil || '',
+    company: item.gesellschaft || item.company || item.anbieter || '',
+    rent:  rent  > 0 ? rent.toFixed(2)  : '',
+    rooms: rooms > 0 ? String(rooms)    : '',
+    size:  size  > 0 ? String(size)     : '',
+    wbs:   String(item.wbs || item.wbs_required || ''),
+  };
+}
+
+// ================================================================
 //  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ================================================================
 function toFloat(v) {
