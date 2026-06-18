@@ -145,7 +145,7 @@ function msgGone(apt) {
 }
 
 // ================================================================
-//  АВТОРИЗАЦИЯ — переработанная
+//  АВТОРИЗАЦИЯ
 // ================================================================
 async function doLogin(page) {
   log('Авторизация...');
@@ -153,101 +153,60 @@ async function doLogin(page) {
   await page.goto(C.loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await page.waitForTimeout(2000);
 
-  // Закрываем cookie-попап (сайт блокирует клики пока он открыт)
-  try {
-    // Ищем кнопку "Alle akzeptieren" или "Speichern"
-    const cookieBtns = [
-      'text="Alle akzeptieren"',
-      'text="Speichern"',
-      'text="Akzeptieren"',
-      '[data-cookie-accept]',
-      '.cookie-accept',
-    ];
-    for (const sel of cookieBtns) {
-      try {
-        const btn = page.locator(sel).first();
-        if (await btn.isVisible({ timeout: 2000 })) {
-          await btn.click();
-          log('Cookie попап закрыт');
-          await page.waitForTimeout(1000);
-          break;
-        }
-      } catch (_) {}
-    }
-  } catch (_) {}
-
-  // Ждём полной инициализации Livewire
-  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(2000);
-
-  // Скриншот ДО — шлём в Telegram для диагностики
-  const ssBefore = path.join(C.outDir, 'before_login.png');
-  await page.screenshot({ path: ssBefore });
-  await tgPhoto(ssBefore, 'Форма входа до заполнения').catch(() => {});
-
-  // Email
-  const emailField = page.locator('input[type="email"]').first();
-  await emailField.waitFor({ state: 'visible', timeout: 15000 });
-  await emailField.click();
-  await page.waitForTimeout(300);
-  await emailField.fill(C.email);
-  const emailVal = await emailField.inputValue();
-  log('Email введён:', emailVal === C.email ? 'OK' : 'ОШИБКА: "' + emailVal + '"');
-
-  // Пароль — вводим и СРАЗУ нажимаем без пауз (Livewire сбрасывает поле если ждать)
-  const passField = page.locator('input[type="password"]').first();
-  await passField.click();
-  await passField.fill(C.password);
-  // Проверяем что пароль реально в поле
-  const passLen = (await passField.inputValue()).length;
-  log('Пароль введён: ' + passLen + ' символов');
-
-  if (passLen === 0) {
-    // Livewire заблокировал fill — пробуем через keyboard
-    log('fill не сработал, пробую pressSequentially...');
-    await passField.click();
-    await page.keyboard.type(C.password, { delay: 30 });
-    const passLen2 = (await passField.inputValue()).length;
-    log('После keyboard.type: ' + passLen2 + ' символов');
+  // Cookie попап
+  for (const s of [
+    'text="Alle akzeptieren"', 'text="Speichern"', 'text="Akzeptieren"'
+  ]) {
+    try {
+      const btn = page.locator(s).first();
+      if (await btn.isVisible({ timeout: 2000 })) {
+        await btn.click();
+        log('Cookie попап закрыт');
+        await page.waitForTimeout(1000);
+        break;
+      }
+    } catch (_) {}
   }
 
-  // Чекбокс
-  try {
-    const cb = page.locator('input[type="checkbox"]').first();
-    if (await cb.isVisible({ timeout: 500 })) { await cb.check(); }
-  } catch (_) {}
+  // Ждём форму
+  await page.locator('input[type="email"]').first().waitFor({ state: 'visible', timeout: 15000 });
 
-  // Нажимаем СРАЗУ — без скриншота и паузы перед кнопкой
-  const submitBtn = page.locator('button[type="submit"]').first();
-  await submitBtn.waitFor({ state: 'visible', timeout: 5000 });
-  await submitBtn.click();
-  log('Кнопка Log in нажата');
+  // Вводим через pressSequentially — обходит Livewire защиту
+  await page.locator('input[type="email"]').first().click();
+  await page.locator('input[type="email"]').first().pressSequentially(C.email, { delay: 80 });
+  log('Email введён');
 
+  await page.locator('input[type="password"]').first().click();
+  await page.locator('input[type="password"]').first().pressSequentially(C.password, { delay: 80 });
+  log('Пароль введён');
+
+  // Нажимаем сразу
+  await page.locator('button[type="submit"]').first().click();
+  log('Log in нажат');
+
+  // Ждём редиректа
   await page.waitForTimeout(5000);
   await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-  await page.waitForTimeout(2000);
 
-  const currentUrl = page.url();
-  log('URL после логина:', currentUrl);
+  const url = page.url();
+  log('URL после логина:', url);
 
-  const ssAfter = path.join(C.outDir, 'after_login.png');
-  await page.screenshot({ path: ssAfter });
-  await tgPhoto(ssAfter, 'После Log in. URL: ' + currentUrl).catch(() => {});
-
-  if (currentUrl.includes('/login')) {
+  if (url.includes('/login')) {
+    const body = await page.locator('body').innerText().catch(() => '');
+    log('Ответ сайта:', body.slice(0, 200));
+    // Пробуем ещё раз подождать редирект
     try {
       await page.waitForURL(u => !u.includes('/login'), { timeout: 10000 });
-      log('Залогинен (редирект с задержкой), URL:', page.url());
+      log('✅ Авторизован (поздний редирект):', page.url());
     } catch (_) {
-      const bodyText = await page.locator('body').innerText().catch(() => '');
-      log('Текст после логина:', bodyText.slice(0, 300));
-      if (bodyText.includes('überprüfen') || bodyText.includes('ungültig') || bodyText.includes('falsch')) {
-        throw new Error('Сайт отклонил логин. Смотри скриншоты в Telegram.');
+      if (!body.includes('überprüfen') && !body.includes('ungültig') && !body.includes('falsch')) {
+        log('✅ Авторизован (Livewire, без редиректа)');
+        return;
       }
-      log('Залогинен (Livewire, URL не сменился)');
+      throw new Error('Сайт отклонил логин — überprüfen. Email: ' + C.email.slice(0,5) + '...');
     }
   } else {
-    log('Авторизован, URL:', currentUrl);
+    log('✅ Авторизован:', url);
   }
 }
 
