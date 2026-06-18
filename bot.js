@@ -1,15 +1,5 @@
 'use strict';
 
-/**
- * ================================================================
- *  inberlinwohnen.de — Бот мониторинга квартир
- * ================================================================
- *  Railway Variables:
- *    INBERLIN_EMAIL, INBERLIN_PASSWORD
- *    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
- * ================================================================
- */
-
 require('dotenv').config();
 const { chromium } = require('playwright');
 const axios    = require('axios');
@@ -31,16 +21,16 @@ const C = {
 
   intervalMs: 5 * 60 * 1000,
 
-  loginUrl:  'https://www.inberlinwohnen.de/login',
-  finderUrl: 'https://www.inberlinwohnen.de/wohnungsfinder',
-  baseUrl:   'https://www.inberlinwohnen.de',
-  outDir:    path.join(__dirname, 'out'),
+  loginUrl:   'https://www.inberlinwohnen.de/login',
+  finderUrl:  'https://www.inberlinwohnen.de/mein-bereich/wohnungsfinder',
+  baseUrl:    'https://www.inberlinwohnen.de',
+  outDir:     path.join(__dirname, 'out'),
 };
 
 if (!fs.existsSync(C.outDir)) fs.mkdirSync(C.outDir, { recursive: true });
 
 // ================================================================
-//  ПРОВЕРКА КОНФИГА
+//  КОНФИГ ПРОВЕРКА
 // ================================================================
 function checkConfig() {
   const missing = [];
@@ -69,10 +59,7 @@ function log(...a) {
 // ================================================================
 const stateFile = path.join(C.outDir, 'state.json');
 function loadState() {
-  try {
-    if (fs.existsSync(stateFile))
-      return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  } catch (_) {}
+  try { if (fs.existsSync(stateFile)) return JSON.parse(fs.readFileSync(stateFile, 'utf8')); } catch (_) {}
   return { known: {}, lastCount: null, firstRun: true };
 }
 function saveState(s) { fs.writeFileSync(stateFile, JSON.stringify(s, null, 2)); }
@@ -86,8 +73,7 @@ const TG = `https://api.telegram.org/bot${C.tgToken}`;
 async function tgText(text, extra = {}) {
   try {
     await axios.post(`${TG}/sendMessage`, {
-      chat_id: C.tgChatId,
-      text,
+      chat_id: C.tgChatId, text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...extra,
@@ -102,9 +88,7 @@ async function tgPhoto(filePath, caption = '') {
     form.append('photo',      fs.createReadStream(filePath));
     form.append('caption',    caption.slice(0, 1024));
     form.append('parse_mode', 'HTML');
-    await axios.post(`${TG}/sendPhoto`, form, {
-      headers: form.getHeaders(), timeout: 30000,
-    });
+    await axios.post(`${TG}/sendPhoto`, form, { headers: form.getHeaders(), timeout: 30000 });
   } catch (e) { log('TG photo error:', e.message); }
 }
 
@@ -135,28 +119,76 @@ function msgGone(apt) {
   return [
     '❌ <b>Квартира снята с публикации</b>',
     '',
-    apt.title   ? apt.title                   : null,
-    apt.address ? `📍 ${apt.address}`         : null,
-    apt.rooms   ? `🛏 ${apt.rooms} комн.`    : null,
-    apt.size    ? `📐 ${apt.size} м²`        : null,
-    apt.rent    ? `💶 ${apt.rent} €`         : null,
+    apt.title   ? apt.title              : null,
+    apt.address ? `📍 ${apt.address}`    : null,
+    apt.rooms   ? `🛏 ${apt.rooms} комн.` : null,
+    apt.size    ? `📐 ${apt.size} м²`   : null,
+    apt.rent    ? `💶 ${apt.rent} €`    : null,
     `🔗 ${apt.url}`,
   ].filter(Boolean).join('\n');
 }
 
 // ================================================================
-//  АВТОРИЗАЦИЯ
+//  SAFE GOTO — защита от Download/редиректов
 // ================================================================
-async function doLogin(page) {
+async function safeGoto(page, url) {
+  try {
+    const resp = await page.goto(url, { waitUntil: 'commit', timeout: 45000 });
+    return resp;
+  } catch (e) {
+    log('GOTO ERROR:', url, e.message);
+    return null;
+  }
+}
+
+// ================================================================
+//  БРАУЗЕР — создаём один раз, держим сессию
+// ================================================================
+let browser  = null;
+let ctx      = null;
+let page     = null;
+let loggedIn = false;
+
+async function ensureBrowser() {
+  if (!browser || !browser.isConnected()) {
+    log('Запускаю браузер...');
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    ctx = null; page = null; loggedIn = false;
+  }
+  if (!ctx) {
+    ctx = await browser.newContext({
+      locale: 'de-DE', timezoneId: 'Europe/Berlin',
+      viewport: { width: 1280, height: 900 },
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    });
+    page = await ctx.newPage();
+    page.setDefaultTimeout(30000);
+    loggedIn = false;
+  }
+}
+
+async function resetSession() {
+  log('Сбрасываю сессию...');
+  try { if (ctx) await ctx.close(); } catch (_) {}
+  ctx = null; page = null; loggedIn = false;
+}
+
+// ================================================================
+//  АВТОРИЗАЦИЯ — один раз, потом держим сессию
+// ================================================================
+async function doLogin() {
   log('Авторизация...');
 
-  await page.goto(C.loginUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  const resp = await safeGoto(page, C.loginUrl);
+  if (!resp) throw new Error('Страница логина недоступна');
+
   await page.waitForTimeout(2000);
 
   // Cookie попап
-  for (const s of [
-    'text="Alle akzeptieren"', 'text="Speichern"', 'text="Akzeptieren"'
-  ]) {
+  for (const s of ['text="Alle akzeptieren"', 'text="Speichern"', 'text="Akzeptieren"']) {
     try {
       const btn = page.locator(s).first();
       if (await btn.isVisible({ timeout: 2000 })) {
@@ -168,10 +200,9 @@ async function doLogin(page) {
     } catch (_) {}
   }
 
-  // Ждём форму
   await page.locator('input[type="email"]').first().waitFor({ state: 'visible', timeout: 15000 });
 
-  // Вводим через pressSequentially — обходит Livewire защиту
+  // pressSequentially — обходит Livewire защиту
   await page.locator('input[type="email"]').first().click();
   await page.locator('input[type="email"]').first().pressSequentially(C.email, { delay: 80 });
   log('Email введён');
@@ -180,11 +211,9 @@ async function doLogin(page) {
   await page.locator('input[type="password"]').first().pressSequentially(C.password, { delay: 80 });
   log('Пароль введён');
 
-  // Нажимаем сразу
   await page.locator('button[type="submit"]').first().click();
   log('Log in нажат');
 
-  // Ждём редиректа
   await page.waitForTimeout(5000);
   await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
 
@@ -193,197 +222,200 @@ async function doLogin(page) {
 
   if (url.includes('/login')) {
     const body = await page.locator('body').innerText().catch(() => '');
-    log('Ответ сайта:', body.slice(0, 200));
-    // Пробуем ещё раз подождать редирект
+    if (body.includes('überprüfen') || body.includes('ungültig') || body.includes('falsch')) {
+      throw new Error('Неверный email или пароль');
+    }
     try {
       await page.waitForURL(u => !u.includes('/login'), { timeout: 10000 });
-      log('✅ Авторизован (поздний редирект):', page.url());
     } catch (_) {
-      if (!body.includes('überprüfen') && !body.includes('ungültig') && !body.includes('falsch')) {
-        log('✅ Авторизован (Livewire, без редиректа)');
-        return;
-      }
-      throw new Error('Сайт отклонил логин — überprüfen. Email: ' + C.email.slice(0,5) + '...');
+      log('Livewire — нет редиректа, считаем залогиненным');
     }
-  } else {
-    log('✅ Авторизован:', url);
+  }
+
+  log('✅ Авторизован:', page.url());
+  loggedIn = true;
+}
+
+async function ensureLoggedIn() {
+  if (loggedIn) {
+    // Проверяем что сессия жива — пробуем зайти на finder
+    const resp = await safeGoto(page, C.finderUrl);
+    if (!resp) { loggedIn = false; }
+    else {
+      const url = page.url();
+      if (url.includes('/login')) {
+        log('Сессия истекла, перелогиниваюсь...');
+        loggedIn = false;
+      }
+    }
+  }
+  if (!loggedIn) {
+    await doLogin();
+    // После логина сразу переходим на finder
+    await safeGoto(page, C.finderUrl);
+    await page.waitForTimeout(2000);
   }
 }
 
 // ================================================================
-//  ПАРСИНГ КВАРТИР
+//  ПАРСИНГ — все страницы
 // ================================================================
-async function scrape(page) {
-  log('Загружаю wohnungsfinder...');
+async function scrapeAll() {
+  log('Парсю квартиры...');
 
-  await page.goto(C.finderUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(2000);
-
-  // Закрыть cookie попап если появился
-  for (const s of ['text="Alle akzeptieren"', 'text="Speichern"']) {
-    try {
-      const b = page.locator(s).first();
-      if (await b.isVisible({ timeout: 1500 })) { await b.click(); await page.waitForTimeout(800); }
-    } catch (_) {}
-  }
-
-  await page.waitForLoadState('networkidle', { timeout: 25000 }).catch(() => {});
-  await page.waitForTimeout(3000);
-
-  // Скриншот первой страницы
-  const ssPath = path.join(C.outDir, 'results.png');
-  await page.screenshot({ path: ssPath, fullPage: false });
-
-  // Парсим все страницы
   const all = [];
   let pageNum = 1;
 
   while (true) {
-    log('Парсю страницу ' + pageNum + '...');
-    const items = await parsePage(page);
-    log('Страница ' + pageNum + ': ' + items.length + ' квартир');
+    log(`Страница ${pageNum}...`);
+    const items = await parseCurrentPage();
+    log(`Страница ${pageNum}: ${items.length} квартир`);
     all.push(...items);
 
     // Ищем кнопку следующей страницы
-    // На скриншоте видно: ссылки "1", "2", "Vor" в пагинации
-    // Ищем по тексту "Vor" или по номеру следующей страницы
-    const nextPageNum = pageNum + 1;
-    let nextBtn = null;
-    let hasNext = false;
-
-    // Вариант 1: ссылка с текстом "Vor"
-    const vorBtn = page.locator('a').filter({ hasText: /^Vor$/ }).first();
-    try { if (await vorBtn.isVisible({ timeout: 1500 })) { nextBtn = vorBtn; hasNext = true; } } catch (_) {}
-
-    // Вариант 2: ссылка с номером следующей страницы
+    const hasNext = await goToNextPage(page, pageNum);
     if (!hasNext) {
-      const numBtn = page.locator('a').filter({ hasText: new RegExp('^' + nextPageNum + '$') }).first();
-      try { if (await numBtn.isVisible({ timeout: 1500 })) { nextBtn = numBtn; hasNext = true; } } catch (_) {}
-    }
-
-    // Вариант 3: любая ссылка пагинации ведущая на следующую страницу
-    if (!hasNext) {
-      const pageLinks = page.locator('a[href*="page=' + nextPageNum + '"], a[href*="seite=' + nextPageNum + '"], a[href*="p=' + nextPageNum + '"]').first();
-      try { if (await pageLinks.isVisible({ timeout: 1500 })) { nextBtn = pageLinks; hasNext = true; } } catch (_) {}
-    }
-
-    // Логируем для диагностики
-    if (hasNext) {
-      const btnText = await nextBtn.innerText().catch(() => '?');
-      log('Следующая страница найдена: "' + btnText.trim() + '"');
-    } else {
-      // Логируем все видимые ссылки с цифрами — для диагностики
-      const allLinks = await page.locator('a').all();
-      const linkTexts = [];
-      for (const l of allLinks.slice(0, 30)) {
-        const t = (await l.innerText().catch(() => '')).trim();
-        if (t && t.length < 20) linkTexts.push(t);
-      }
-      log('Кнопка следующей страницы не найдена. Ссылки на странице: ' + linkTexts.join(' | '));
-      log('Больше страниц нет, итого: ' + all.length);
+      log(`Пагинация закончилась. Всего: ${all.length}`);
       break;
     }
-
-    await nextBtn.click();
-    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(3000);
     pageNum++;
-
     if (pageNum > 10) break;
   }
 
-  return { apartments: dedupe(all), ssPath };
+  return dedupe(all);
 }
 
-// Парсим одну страницу результатов
-// Формат карточек на сайте:
-// "3.0 Zimmer, 70,28 m², 466,94 € | Alfred-Randt-Straße 32, 12559 Treptow-Köpenick"
-async function parsePage(page) {
-  const result = [];
+async function goToNextPage(page, currentPageNum) {
+  const nextNum = currentPageNum + 1;
 
-  // Сначала пробуем получить структурированные данные из Livewire snapshot в HTML
-  const html = await page.content();
-  fs.writeFileSync(path.join(C.outDir, 'finder.html'), html);
+  // Логируем все ссылки пагинации для диагностики
+  const allLinks = await page.locator('a').all();
+  const linkInfo = [];
+  for (const l of allLinks) {
+    try {
+      const t    = (await l.innerText()).trim();
+      const href = (await l.getAttribute('href') || '').trim();
+      if (t && t.length < 30) linkInfo.push(`"${t}"→${href.slice(0,40)}`);
+    } catch (_) {}
+  }
+  log('Все ссылки на странице:', linkInfo.join(' | ').slice(0, 300));
 
-  const fromLivewire = extractFromLivewire(html);
-  if (fromLivewire.length > 0) {
-    log('Livewire данные: ' + fromLivewire.length + ' квартир');
-    return fromLivewire;
+  // Пробуем разные варианты кнопки следующей страницы
+  const candidates = [
+    // По тексту
+    page.locator('a').filter({ hasText: /^Vor$/ }).first(),
+    page.locator('a').filter({ hasText: /^Vor >$/ }).first(),
+    page.locator('a').filter({ hasText: /^>$/ }).first(),
+    page.locator('a').filter({ hasText: /^»$/ }).first(),
+    page.locator('a').filter({ hasText: new RegExp('^' + nextNum + '$') }).first(),
+    // По href
+    page.locator(`a[href*="page=${nextNum}"]`).first(),
+    page.locator(`a[href*="seite=${nextNum}"]`).first(),
+    page.locator(`a[href*="p=${nextNum}"]`).first(),
+    // По классу
+    page.locator('li.next a, .pagination-next a, a.next').first(),
+    page.locator('[class*="pagination"] a[rel="next"]').first(),
+  ];
+
+  for (const btn of candidates) {
+    try {
+      if (await btn.isVisible({ timeout: 800 })) {
+        const t = (await btn.innerText()).trim();
+        log(`Кнопка следующей страницы: "${t}"`);
+        await btn.click();
+        await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+        await page.waitForTimeout(2000);
+        return true;
+      }
+    } catch (_) {}
   }
 
-  // Fallback: парсим DOM карточки
-  // На сайте карточки выглядят как строки с паттерном "X.0 Zimmer, Y m², Z €"
-  const rows = await page.locator('li, tr, [class*="result"], [class*="item"], [class*="row"]').all();
+  return false;
+}
+
+// ================================================================
+//  ПАРСИНГ ОДНОЙ СТРАНИЦЫ
+// ================================================================
+async function parseCurrentPage() {
+  const result = [];
+
+  // Скриншот только на первой странице (для firstRun сообщения)
+  const ssPath = path.join(C.outDir, 'results.png');
+  if (!fs.existsSync(ssPath)) {
+    await page.screenshot({ path: ssPath, fullPage: false });
+  }
+
+  // Ищем строки с квартирами
+  // Формат: "3.0 Zimmer, 70,28 m², 466,94 € | Alfred-Randt-Straße 32, 12559 Treptow-Köpenick"
+  const rows = await page.locator('li, tr, [class*="result"], [class*="item"], [class*="expose"]').all();
 
   for (const row of rows) {
     try {
-      const text = await row.innerText().catch(() => '');
-      // Проверяем что это карточка квартиры — должны быть Zimmer и €
+      const text = (await row.innerText().catch(() => '')).trim();
       if (!text.includes('Zimmer') || !text.includes('€')) continue;
-      // Минимальная длина
-      if (text.trim().length < 20) continue;
+      if (text.length < 15) continue;
 
-      const apt = parseCardText(text, row, page);
+      const apt = parseAptText(text);
       if (!apt) continue;
 
       // Ищем ссылку
-      apt.url = await findUrl(row) || C.finderUrl;
-      apt.id  = apt.url !== C.finderUrl ? apt.url : 'apt_' + apt.rent + '_' + apt.rooms + '_' + apt.size;
+      apt.url = await findLink(row) || C.finderUrl;
+      apt.id  = apt.url !== C.finderUrl ? apt.url
+              : `apt_${apt.rooms}_${apt.rent}_${apt.size}_${apt.address.slice(0,20)}`;
 
       if (passesFilter(apt)) result.push(apt);
     } catch (_) {}
   }
 
-  // Если DOM не дал — парсим по тексту строк
+  // Если ничего не нашли — пробуем через все ссылки на странице
   if (result.length === 0) {
-    log('DOM пустой, парсю по тексту страницы...');
-    return parseByText(html, page);
+    log('Rows пустые, парсю через ссылки...');
+    return parseViaLinks();
   }
 
   return result;
 }
 
-// Парсим текст карточки — формат сайта известен из скриншота
-// "3.0 Zimmer, 70,28 m², 466,94 € | Alfred-Randt-Straße 32, 12559 Treptow-Köpenick"
-function parseCardText(text, el, page) {
-  // Комнаты: "3.0 Zimmer" или "2 1/2-Zimmer"
-  const roomsMatch = text.match(/(\d+(?:[.,]\d+)?)\s*(?:1\/2-)?Zimmer/i)
-                  || text.match(/(\d+(?:[.,]\d+)?)\s*Zi\./i);
+// ================================================================
+//  ПАРСИНГ ТЕКСТА КАРТОЧКИ
+//  Формат: "3.0 Zimmer, 70,28 m², 466,94 € | Straße 32, 12559 Berlin"
+// ================================================================
+function parseAptText(text) {
+  // Комнаты: "3.0 Zimmer", "2 1/2-Zimmer", "3 Zimmer"
+  const roomsMatch = text.match(/(\d+(?:[.,]\d+)?)\s*(?:1\/2-)?Zimmer/i);
   const rooms = roomsMatch ? toFloat(roomsMatch[1]) : null;
 
   // Площадь: "70,28 m²"
   const sizeMatch = text.match(/(\d+(?:[,.]?\d+)?)\s*m²/i);
   const size = sizeMatch ? toFloat(sizeMatch[1]) : null;
 
-  // Аренда: "466,94 €" — берём первое число перед € от 100 до 9999
-  const rentMatch = text.match(/(\d{3,4}(?:[,.]\d{1,2})?)\s*€/);
+  // Аренда: "466,94 €" — от 100 до 9999
+  const rentMatch = text.match(/\b(\d{3,4}(?:[,.]\d{1,2})?)\s*€/);
   const rent = rentMatch ? toFloat(rentMatch[1]) : null;
 
-  // Адрес — всё что после "|"
+  // Адрес — после символа "|"
   let address = '';
   let district = '';
   const pipeIdx = text.indexOf('|');
   if (pipeIdx !== -1) {
-    const afterPipe = text.slice(pipeIdx + 1).trim().split('\n')[0].trim();
-    // "Alfred-Randt-Straße 32, 12559 Treptow-Köpenick"
-    address = afterPipe;
-    // Район — последняя часть после PLZ
-    const distMatch = afterPipe.match(/\d{5}\s+(.+)/);
-    if (distMatch) district = distMatch[1].trim();
+    // Берём первую строку после |
+    const raw = text.slice(pipeIdx + 1).trim().split('\n')[0].trim();
+    address = raw;
+    // PLZ паттерн: "12559 Treptow-Köpenick" → район = "Treptow-Köpenick"
+    const plzMatch = raw.match(/\d{5}\s+(.+)/);
+    if (plzMatch) district = plzMatch[1].trim();
   } else {
-    // Пробуем найти адрес по паттерну улицы
-    address = extractAddress(text);
+    address  = extractAddress(text);
     district = extractDistrict(text);
   }
 
   if (!rooms && !rent) return null;
 
   return {
-    id:       '',
-    url:      C.finderUrl,
-    title:    '',
+    id: '', url: C.finderUrl,
+    title: '',
     address,
-    district,
+    district: district || extractDistrict(text),
     company:  extractCompany(text),
     rent:     rent  != null ? rent.toFixed(2)  : '',
     rooms:    rooms != null ? String(rooms)    : '',
@@ -392,17 +424,17 @@ function parseCardText(text, el, page) {
   };
 }
 
-async function findUrl(el) {
+async function findLink(el) {
   try {
     const links = await el.locator('a[href]').all();
     for (const link of links) {
       const href = (await link.getAttribute('href') || '').trim();
       if (!href || href === '#') continue;
-      if (href.match(/\d{4,}/) || href.includes('expose') || href.includes('objekt') || href.includes('wohnung')) {
+      if (href.match(/\d{4,}/) || /expose|objekt|wohnung|apartment/i.test(href)) {
         return href.startsWith('http') ? href : C.baseUrl + href;
       }
     }
-    // Берём любую ссылку кроме якорей
+    // Любая непустая ссылка
     for (const link of links) {
       const href = (await link.getAttribute('href') || '').trim();
       if (href && href !== '#' && !href.startsWith('mailto') && !href.startsWith('tel')) {
@@ -413,22 +445,21 @@ async function findUrl(el) {
   return null;
 }
 
-async function parseByText(html, page) {
-  // Ищем все ссылки на странице у которых есть текст с Zimmer/€ в родителе
+async function parseViaLinks() {
   const result = [];
   const links = await page.locator('a[href]').all();
 
   for (const link of links) {
     try {
       const href = (await link.getAttribute('href') || '').trim();
-      if (!href || href === '#') continue;
+      if (!href || href === '#' || href.startsWith('mailto') || href.startsWith('tel')) continue;
 
       const fullUrl = href.startsWith('http') ? href : C.baseUrl + href;
+      if (result.find(a => a.id === fullUrl)) continue;
 
-      // Берём текст из родителя (до 4 уровней)
       const parentText = await link.evaluate(el => {
         let node = el;
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 5; i++) {
           node = node.parentElement;
           if (!node) break;
           const t = (node.innerText || '').trim();
@@ -438,9 +469,8 @@ async function parseByText(html, page) {
       }).catch(() => '');
 
       if (!parentText.includes('Zimmer') && !parentText.includes('€')) continue;
-      if (result.find(a => a.id === fullUrl)) continue;
 
-      const apt = parseCardText(parentText, null, page);
+      const apt = parseAptText(parentText);
       if (!apt) continue;
       apt.id  = fullUrl;
       apt.url = fullUrl;
@@ -453,102 +483,11 @@ async function parseByText(html, page) {
 }
 
 // ================================================================
-//  LIVEWIRE + API ИЗВЛЕЧЕНИЕ
-// ================================================================
-function extractFromLivewire(html) {
-  const apartments = [];
-  try {
-    const patterns = [
-      /wire:snapshot="([^"]+)"/g,
-      /wire:initial-data="([^"]+)"/g,
-    ];
-    for (const rx of patterns) {
-      let m;
-      while ((m = rx.exec(html)) !== null) {
-        try {
-          const raw = m[1].replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, '&');
-          const data = JSON.parse(raw);
-          const items = findApartmentArray(data);
-          for (const item of items) {
-            const apt = normalizeItem(item);
-            if (apt && passesFilter(apt)) apartments.push(apt);
-          }
-        } catch (_) {}
-      }
-    }
-    // JSON в script тегах
-    const scriptRx = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-    let sm;
-    while ((sm = scriptRx.exec(html)) !== null) {
-      const jsonRx = /(\[{.+?}\])/gs;
-      let jm;
-      while ((jm = jsonRx.exec(sm[1])) !== null) {
-        try {
-          const arr = JSON.parse(jm[1]);
-          if (Array.isArray(arr) && arr.length > 0 && hasAptFields(arr[0])) {
-            for (const item of arr) {
-              const apt = normalizeItem(item);
-              if (apt && passesFilter(apt)) apartments.push(apt);
-            }
-          }
-        } catch (_) {}
-      }
-    }
-  } catch (e) { log('Livewire parse error:', e.message); }
-  return dedupe(apartments);
-}
-
-function findApartmentArray(obj, depth = 0) {
-  if (depth > 6 || !obj || typeof obj !== 'object') return [];
-  if (Array.isArray(obj) && obj.length > 0 && hasAptFields(obj[0])) return obj;
-  for (const key of Object.keys(obj)) {
-    if (Array.isArray(obj[key]) && obj[key].length > 0 && hasAptFields(obj[key][0])) return obj[key];
-    const found = findApartmentArray(obj[key], depth + 1);
-    if (found.length > 0) return found;
-  }
-  return [];
-}
-
-function hasAptFields(o) {
-  if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
-  const keys = Object.keys(o).join(' ').toLowerCase();
-  return keys.includes('rent') || keys.includes('miete') || keys.includes('zimmer') ||
-         keys.includes('rooms') || keys.includes('wohnfl') || keys.includes('expose') ||
-         keys.includes('kaltmiete') || keys.includes('flaeche');
-}
-
-function normalizeItem(item) {
-  if (!item || typeof item !== 'object') return null;
-  const rent  = toFloat(item.kaltmiete || item.kaltmiete_in_euro || item['kaltmiete-in-euro'] || item.rent || item.cold_rent || item.miete || item.price || 0);
-  const rooms = toFloat(item.zimmer || item.zimmeranzahl || item['anzahl-zimmer'] || item.rooms || item.room_count || 0);
-  const size  = toFloat(item.wohnflaeche || item['wohn-flaeche'] || item.flaeche || item.size || item.area || 0);
-  let url = item.url || item.link || item.href || item.expose_url || item.detail_url || '';
-  if (url && !url.startsWith('http')) url = C.baseUrl + (url.startsWith('/') ? '' : '/') + url;
-  if (!url) { const id = item.id || item.expose_id || item.objekt_id; if (id) url = C.baseUrl + '/wohnungsfinder/?objekt=' + id; else url = C.finderUrl; }
-  const id = String(item.id || item.expose_id || item.objekt_id || url);
-  const address = [item.strasse || item.street || item.adresse || item.address || '', item.hausnummer || ''].filter(Boolean).join(' ').trim() || item.standort || '';
-  return {
-    id, url, title: item.titel || item.title || item.bezeichnung || '',
-    address, district: item.bezirk || item.district || item.stadtteil || item.ortsteil || '',
-    company: item.gesellschaft || item.company || item.anbieter || '',
-    rent:  rent  > 0 ? rent.toFixed(2)  : '',
-    rooms: rooms > 0 ? String(rooms)    : '',
-    size:  size  > 0 ? String(size)     : '',
-    wbs:   String(item.wbs || item.wbs_required || ''),
-  };
-}
-
-// ================================================================
-//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+//  ВСПОМОГАЛЬНЫЕ ФУНКЦИИ
 // ================================================================
 function toFloat(v) {
   if (!v && v !== 0) return 0;
   return parseFloat(String(v).replace(/\s/g, '').replace(',', '.')) || 0;
-}
-
-function extractNum(text, rx) {
-  const m = text.match(rx);
-  return m ? toFloat(m[1]) : null;
 }
 
 function extractAddress(text) {
@@ -559,10 +498,11 @@ function extractAddress(text) {
 function extractDistrict(text) {
   const list = [
     'Mitte','Tiergarten','Wedding','Prenzlauer Berg','Friedrichshain','Kreuzberg',
-    'Pankow','Weißensee','Heinersdorf','Charlottenburg','Wilmersdorf','Spandau',
-    'Steglitz','Zehlendorf','Tempelhof','Schöneberg','Neukölln','Treptow',
-    'Köpenick','Marzahn','Hellersdorf','Lichtenberg','Hohenschönhausen',
-    'Reinickendorf','Wittenau','Tegel','Buch','Adlershof',
+    'Pankow','Weißensee','Charlottenburg','Wilmersdorf','Spandau','Steglitz',
+    'Zehlendorf','Tempelhof','Schöneberg','Neukölln','Treptow','Köpenick',
+    'Treptow-Köpenick','Marzahn','Hellersdorf','Marzahn-Hellersdorf',
+    'Lichtenberg','Hohenschönhausen','Reinickendorf','Wittenau','Tegel',
+    'Buch','Adlershof','Heinersdorf',
   ];
   for (const d of list) { if (text.includes(d)) return d; }
   return '';
@@ -584,41 +524,36 @@ function passesFilter(apt) {
 
 function dedupe(items) {
   const seen = new Set();
-  return items.filter(a => { if (seen.has(a.id)) return false; seen.add(a.id); return true; });
+  return items.filter(a => {
+    const key = a.id || `${a.rent}_${a.rooms}_${a.address}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ================================================================
-//  ГЛАВНЫЙ ЦИКЛ
+//  ГЛАВНЫЙ ЦИКЛ — while(true) вместо setInterval
 // ================================================================
-let browser  = null;
 let errCount = 0;
 
 async function runCheck() {
-  let page = null;
-  let ctx  = null;
-
   try {
-    if (!browser || !browser.isConnected()) {
-      log('Запускаю браузер...');
-      browser = await chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
-      });
-    }
+    await ensureBrowser();
+    await ensureLoggedIn();
 
-    ctx = await browser.newContext({
-      locale: 'de-DE',
-      timezoneId: 'Europe/Berlin',
-      viewport: { width: 1280, height: 900 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    });
-    page = await ctx.newPage();
-    page.setDefaultTimeout(30000);
+    // Скриншот сбрасываем перед каждой проверкой
+    const ssPath = path.join(C.outDir, 'results.png');
+    if (fs.existsSync(ssPath)) fs.unlinkSync(ssPath);
 
-    await doLogin(page);
-    const { apartments, ssPath } = await scrape(page);
+    const apartments = await scrapeAll();
+
+    // Дебаг первых 3
+    apartments.slice(0, 3).forEach((a, i) =>
+      log(`[${i}] rooms=${a.rooms} rent=${a.rent}€ size=${a.size}m² | ${a.address} | ${a.url.slice(0, 60)}`)
+    );
 
     const prevKnown = STATE.known || {};
     const currMap   = {};
@@ -640,12 +575,10 @@ async function runCheck() {
         `⏱ Каждые ${C.intervalMs / 60000} мин\n\n` +
         `📊 Сейчас по фильтру: <b>${apartments.length} квартир</b>`
       );
-      if (fs.existsSync(ssPath)) {
-        await tgPhoto(ssPath, `Страница поиска (${apartments.length} квартир)`);
-      }
+      const ssPath2 = path.join(C.outDir, 'results.png');
+      if (fs.existsSync(ssPath2)) await tgPhoto(ssPath2, `Страница поиска (${apartments.length} квартир)`);
     }
 
-    // Новые квартиры
     for (const apt of added) {
       log('НОВАЯ:', apt.id);
       const { text, markup } = msgNew(apt);
@@ -653,14 +586,12 @@ async function runCheck() {
       await sleep(700);
     }
 
-    // Ушедшие квартиры
     for (const apt of removed) {
       log('УШЛА:', apt.id);
       await tgText(msgGone(apt));
       await sleep(700);
     }
 
-    // Изменилось количество без совпадений по ID
     if (!STATE.firstRun && STATE.lastCount !== null &&
         STATE.lastCount !== apartments.length &&
         added.length === 0 && removed.length === 0) {
@@ -675,31 +606,35 @@ async function runCheck() {
   } catch (e) {
     errCount++;
     log('ОШИБКА:', e.message);
-    if (errCount <= 3) {
-      await tgText(`⚠️ Ошибка #${errCount}:\n<code>${e.message}</code>`).catch(() => {});
-    }
+    await tgText(`⚠️ Ошибка #${errCount}:\n<code>${e.message}</code>`).catch(() => {});
+
+    // Сбрасываем сессию при ошибках
+    await resetSession();
+
+    // При многих ошибках подряд — пересоздаём браузер
     if (errCount % 3 === 0) {
-      try { await browser?.close(); } catch (_) {}
+      try { if (browser) await browser.close(); } catch (_) {}
       browser = null;
     }
-  } finally {
-    try { if (page) await page.close(); } catch (_) {}
-    try { if (ctx)  await ctx.close();  } catch (_) {}
   }
 }
 
 // ================================================================
-//  СТАРТ
+//  СТАРТ — while(true) без setInterval
 // ================================================================
 async function main() {
   checkConfig();
   log('=== Бот inberlinwohnen.de ===');
-  await runCheck();
-  setInterval(() => { log('--- Проверка ---'); runCheck(); }, C.intervalMs);
+
+  while (true) {
+    await runCheck();
+    log(`Жду ${C.intervalMs / 60000} мин до следующей проверки...`);
+    await sleep(C.intervalMs);
+  }
 }
 
-process.on('SIGINT',  async () => { try { await browser?.close(); } catch (_) {} process.exit(0); });
-process.on('SIGTERM', async () => { try { await browser?.close(); } catch (_) {} process.exit(0); });
+process.on('SIGINT',  async () => { log('SIGINT'); try { await browser?.close(); } catch (_) {} process.exit(0); });
+process.on('SIGTERM', async () => { log('SIGTERM'); try { await browser?.close(); } catch (_) {} process.exit(0); });
 process.on('uncaughtException', async (e) => {
   log('UNCAUGHT:', e.stack);
   try { await tgText(`💥 Критическая ошибка:\n<code>${e.message}</code>`); } catch (_) {}
