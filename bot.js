@@ -384,9 +384,9 @@ async function parseCurrentPage() {
       if (!apt) continue;
 
       // Ищем ссылку
-      apt.url = await findLink(row) || C.finderUrl;
-      apt.id  = apt.url !== C.finderUrl ? apt.url
-              : `apt_${apt.rooms}_${apt.rent}_${apt.size}_${apt.address.slice(0,20)}`;
+      apt.url = await findLink(row) || null;
+      // ID — это ВСЕГДА URL если есть, иначе комбинация данных
+      apt.id  = apt.url || `nourl_${apt.rent}_${apt.rooms}_${apt.size}_${Math.random().toString().slice(2,8)}`;
 
       if (passesFilter(apt)) result.push(apt);
     } catch (_) {}
@@ -497,8 +497,8 @@ async function parseViaLinks() {
 
       const apt = parseAptText(parentText);
       if (!apt) continue;
-      apt.id  = fullUrl;
       apt.url = fullUrl;
+      apt.id  = fullUrl;
 
       if (passesFilter(apt)) result.push(apt);
     } catch (_) {}
@@ -550,8 +550,13 @@ function passesFilter(apt) {
 function dedupe(items) {
   const seen = new Set();
   return items.filter(a => {
-    const key = a.id || `${a.rent}_${a.rooms}_${a.address}`;
-    if (seen.has(key)) return false;
+    // Используем URL как основной ключ дедупликации
+    // Если URL нет — нормализуем адрес (убираем пробелы)
+    const key = a.url ? a.url : String(a.address).toLowerCase().replace(/\s+/g, '');
+    if (seen.has(key)) {
+      log('Дубликат найден, пропускаю: ' + key.slice(0,60));
+      return false;
+    }
     seen.add(key);
     return true;
   });
