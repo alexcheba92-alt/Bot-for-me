@@ -189,33 +189,35 @@ async function doLogin(page) {
   const emailField = page.locator('input[type="email"]').first();
   await emailField.waitFor({ state: 'visible', timeout: 15000 });
   await emailField.click();
-  await page.waitForTimeout(400);
-  await emailField.fill(C.email);
   await page.waitForTimeout(300);
+  await emailField.fill(C.email);
   const emailVal = await emailField.inputValue();
   log('Email введён:', emailVal === C.email ? 'OK' : 'ОШИБКА: "' + emailVal + '"');
 
-  // Пароль
+  // Пароль — вводим и СРАЗУ нажимаем без пауз (Livewire сбрасывает поле если ждать)
   const passField = page.locator('input[type="password"]').first();
   await passField.click();
-  await page.waitForTimeout(300);
   await passField.fill(C.password);
-  await page.waitForTimeout(300);
+  // Проверяем что пароль реально в поле
   const passLen = (await passField.inputValue()).length;
   log('Пароль введён: ' + passLen + ' символов');
+
+  if (passLen === 0) {
+    // Livewire заблокировал fill — пробуем через keyboard
+    log('fill не сработал, пробую pressSequentially...');
+    await passField.click();
+    await page.keyboard.type(C.password, { delay: 30 });
+    const passLen2 = (await passField.inputValue()).length;
+    log('После keyboard.type: ' + passLen2 + ' символов');
+  }
 
   // Чекбокс
   try {
     const cb = page.locator('input[type="checkbox"]').first();
-    if (await cb.isVisible({ timeout: 1000 })) { await cb.check(); }
+    if (await cb.isVisible({ timeout: 500 })) { await cb.check(); }
   } catch (_) {}
 
-  // Скриншот с заполненной формой
-  const ssFilled = path.join(C.outDir, 'form_filled.png');
-  await page.screenshot({ path: ssFilled });
-  await tgPhoto(ssFilled, 'Форма входа (заполненная)').catch(() => {});
-
-  // Нажимаем
+  // Нажимаем СРАЗУ — без скриншота и паузы перед кнопкой
   const submitBtn = page.locator('button[type="submit"]').first();
   await submitBtn.waitFor({ state: 'visible', timeout: 5000 });
   await submitBtn.click();
