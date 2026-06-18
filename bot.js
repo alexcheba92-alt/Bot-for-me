@@ -300,7 +300,7 @@ async function goToNextPage(page, currentPageNum) {
   const nextNum = currentPageNum + 1;
 
   // Логируем ВСЕ кликабельные элементы — a и button
-  const allEls = await page.locator('a, button, [wire\:click]').all();
+  const allEls = await page.locator('a, button, span, li').all();
   const elInfo = [];
   for (const el of allEls) {
     try {
@@ -316,34 +316,37 @@ async function goToNextPage(page, currentPageNum) {
     fs.writeFileSync(path.join(C.outDir, 'pagination.html'), html);
   } catch (_) {}
 
-  // Кандидаты — a, button и wire:click элементы
-  const candidates = [
-    // Livewire wire:click (сайт на Livewire!)
-    page.locator('[wire\:click]').filter({ hasText: 'Vor' }).first(),
-    page.locator('[wire\:click]').filter({ hasText: String(nextNum) }).first(),
-    // Кнопки
-    page.locator('button').filter({ hasText: /^Vor/ }).first(),
-    page.locator('button').filter({ hasText: new RegExp('^' + nextNum + '$') }).first(),
-    // Ссылки
-    page.locator('a').filter({ hasText: /^Vor/ }).first(),
-    page.locator('a').filter({ hasText: new RegExp('^' + nextNum + '$') }).first(),
-    page.locator('a').filter({ hasText: /^>$/ }).first(),
-    page.locator('a').filter({ hasText: /^»$/ }).first(),
-    // По href
-    page.locator('a[href*="page=' + nextNum + '"]').first(),
-    page.locator('a[href*="p=' + nextNum + '"]').first(),
-    // Универсально
-    page.locator('text="Vor >"').first(),
-    page.locator('text="Vor"').first(),
-    page.locator('text="' + nextNum + '"').first(),
-  ];
+  // Ищем кнопку пагинации среди ВСЕХ элементов
+  // Livewire использует wire:click атрибут — ищем через XPath и attr
+  const allClickable = await page.locator('a, button, span, li').all();
 
-  for (const btn of candidates) {
+  for (const el of allClickable) {
     try {
-      if (await btn.isVisible({ timeout: 800 })) {
-        const t = (await btn.innerText().catch(() => '?')).trim();
-        log('Кнопка следующей страницы найдена: "' + t + '"');
-        await btn.click();
+      const t = (await el.innerText().catch(() => '')).trim();
+      if (!t) continue;
+
+      const isNext = t === 'Vor' || t === 'Vor >' || t === '>' ||
+                     t === '»' || t === String(nextNum);
+      if (!isNext) continue;
+
+      const visible = await el.isVisible({ timeout: 500 }).catch(() => false);
+      if (!visible) continue;
+
+      log('Кнопка следующей страницы найдена: "' + t + '"');
+      await el.click();
+      await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+      await page.waitForTimeout(3000);
+      return true;
+    } catch (_) {}
+  }
+
+  // Запасной вариант — ищем по href
+  for (const suffix of ['page=' + nextNum, 'p=' + nextNum, 'seite=' + nextNum]) {
+    try {
+      const el = page.locator('a[href*="' + suffix + '"]').first();
+      if (await el.isVisible({ timeout: 500 })) {
+        log('Кнопка по href найдена: ' + suffix);
+        await el.click();
         await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
         await page.waitForTimeout(3000);
         return true;
@@ -351,7 +354,7 @@ async function goToNextPage(page, currentPageNum) {
     } catch (_) {}
   }
 
-  log('Кнопка следующей страницы НЕ найдена. Элементы: ' + elInfo.join(' | ').slice(0, 200));
+  log('Кнопка следующей страницы НЕ найдена. Текстовые элементы: ' + elInfo.join(' | ').slice(0, 300));
   return false;
 }
 
