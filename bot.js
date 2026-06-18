@@ -244,22 +244,51 @@ async function scrape(page) {
     log('Страница ' + pageNum + ': ' + items.length + ' квартир');
     all.push(...items);
 
-    // Ищем кнопку "Vor >" / "Weiter" / "Nächste"
-    const nextBtn = page.locator('a:has-text("Vor"), a:has-text("Weiter"), a:has-text("»"), li.next a, .pagination a[rel="next"]').first();
+    // Ищем кнопку следующей страницы
+    // На скриншоте видно: ссылки "1", "2", "Vor" в пагинации
+    // Ищем по тексту "Vor" или по номеру следующей страницы
+    const nextPageNum = pageNum + 1;
+    let nextBtn = null;
     let hasNext = false;
-    try { hasNext = await nextBtn.isVisible({ timeout: 2000 }); } catch (_) {}
 
+    // Вариант 1: ссылка с текстом "Vor"
+    const vorBtn = page.locator('a').filter({ hasText: /^Vor$/ }).first();
+    try { if (await vorBtn.isVisible({ timeout: 1500 })) { nextBtn = vorBtn; hasNext = true; } } catch (_) {}
+
+    // Вариант 2: ссылка с номером следующей страницы
     if (!hasNext) {
+      const numBtn = page.locator('a').filter({ hasText: new RegExp('^' + nextPageNum + '$') }).first();
+      try { if (await numBtn.isVisible({ timeout: 1500 })) { nextBtn = numBtn; hasNext = true; } } catch (_) {}
+    }
+
+    // Вариант 3: любая ссылка пагинации ведущая на следующую страницу
+    if (!hasNext) {
+      const pageLinks = page.locator('a[href*="page=' + nextPageNum + '"], a[href*="seite=' + nextPageNum + '"], a[href*="p=' + nextPageNum + '"]').first();
+      try { if (await pageLinks.isVisible({ timeout: 1500 })) { nextBtn = pageLinks; hasNext = true; } } catch (_) {}
+    }
+
+    // Логируем для диагностики
+    if (hasNext) {
+      const btnText = await nextBtn.innerText().catch(() => '?');
+      log('Следующая страница найдена: "' + btnText.trim() + '"');
+    } else {
+      // Логируем все видимые ссылки с цифрами — для диагностики
+      const allLinks = await page.locator('a').all();
+      const linkTexts = [];
+      for (const l of allLinks.slice(0, 30)) {
+        const t = (await l.innerText().catch(() => '')).trim();
+        if (t && t.length < 20) linkTexts.push(t);
+      }
+      log('Кнопка следующей страницы не найдена. Ссылки на странице: ' + linkTexts.join(' | '));
       log('Больше страниц нет, итого: ' + all.length);
       break;
     }
 
     await nextBtn.click();
     await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-    await page.waitForTimeout(2000);
+    await page.waitForTimeout(3000);
     pageNum++;
 
-    // Защита от бесконечного цикла
     if (pageNum > 10) break;
   }
 
