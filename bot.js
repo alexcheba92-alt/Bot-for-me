@@ -377,6 +377,8 @@ async function parseCurrentPage() {
   for (const row of rows) {
     try {
       const text = (await row.innerText().catch(() => '')).trim();
+      // Пропускаем навигацию, карты и прочий шум
+      if (text.includes('OpenStreetMap') || text.includes('Startseite') || text.includes('Account')) continue;
       if (!text.includes('Zimmer') || !text.includes('€')) continue;
       if (text.length < 15) continue;
 
@@ -385,7 +387,9 @@ async function parseCurrentPage() {
 
       // Ищем ссылку
       apt.url = await findLink(row) || null;
-      // ID — это ВСЕГДА URL если есть, иначе комбинация данных
+      // Если нет URL или это главная страница — пропускаем
+      if (!apt.url || apt.url.includes('wohnungsfinder') && apt.url === C.finderUrl) continue;
+      // ID — это ВСЕГДА URL если есть
       apt.id  = apt.url || `nourl_${apt.rent}_${apt.rooms}_${apt.size}_${Math.random().toString().slice(2,8)}`;
 
       if (passesFilter(apt)) result.push(apt);
@@ -554,7 +558,7 @@ function dedupe(items) {
     // Если URL нет — нормализуем адрес (убираем пробелы)
     const key = a.url ? a.url : String(a.address).toLowerCase().replace(/\s+/g, '');
     if (seen.has(key)) {
-      log('Дубликат найден, пропускаю: ' + key.slice(0,60));
+      log('Дубликат найден, пропускаю: ' + (key ? key.slice(0,60) : 'null'));
       return false;
     }
     seen.add(key);
