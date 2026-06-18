@@ -176,62 +176,76 @@ async function doLogin(page) {
     }
   } catch (_) {}
 
-  // Скриншот до заполнения — чтобы видеть что за форма
-  await page.screenshot({ path: path.join(C.outDir, 'before_login.png') });
+  // Ждём полной инициализации Livewire
+  await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(2000);
 
-  // Заполняем email — простой fill как в рабочей версии
+  // Скриншот ДО — шлём в Telegram для диагностики
+  const ssBefore = path.join(C.outDir, 'before_login.png');
+  await page.screenshot({ path: ssBefore });
+  await tgPhoto(ssBefore, 'Форма входа до заполнения').catch(() => {});
+
+  // Email
   const emailField = page.locator('input[type="email"]').first();
-  await emailField.waitFor({ state: 'visible', timeout: 10000 });
+  await emailField.waitFor({ state: 'visible', timeout: 15000 });
+  await emailField.click();
+  await page.waitForTimeout(400);
   await emailField.fill(C.email);
-  log('Email введён');
+  await page.waitForTimeout(300);
+  const emailVal = await emailField.inputValue();
+  log('Email введён:', emailVal === C.email ? 'OK' : 'ОШИБКА: "' + emailVal + '"');
 
-  // Заполняем пароль
+  // Пароль
   const passField = page.locator('input[type="password"]').first();
+  await passField.click();
+  await page.waitForTimeout(300);
   await passField.fill(C.password);
-  log('Пароль введён');
+  await page.waitForTimeout(300);
+  const passLen = (await passField.inputValue()).length;
+  log('Пароль введён: ' + passLen + ' символов');
 
-  // Чекбокс "Eingeloggt bleiben"
+  // Чекбокс
   try {
     const cb = page.locator('input[type="checkbox"]').first();
-    if (await cb.isVisible({ timeout: 1000 })) {
-      await cb.check();
-      log('Чекбокс "остаться" активирован');
-    }
+    if (await cb.isVisible({ timeout: 1000 })) { await cb.check(); }
   } catch (_) {}
 
-  // Кнопка submit
+  // Скриншот с заполненной формой
+  const ssFilled = path.join(C.outDir, 'form_filled.png');
+  await page.screenshot({ path: ssFilled });
+  await tgPhoto(ssFilled, 'Форма входа (заполненная)').catch(() => {});
+
+  // Нажимаем
   const submitBtn = page.locator('button[type="submit"]').first();
   await submitBtn.waitFor({ state: 'visible', timeout: 5000 });
   await submitBtn.click();
   log('Кнопка Log in нажата');
 
-  // Ждём навигации после логина
-  await page.waitForTimeout(4000);
+  await page.waitForTimeout(5000);
   await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
   await page.waitForTimeout(2000);
 
   const currentUrl = page.url();
   log('URL после логина:', currentUrl);
 
-  // Скриншот после логина
-  await page.screenshot({ path: path.join(C.outDir, 'after_login.png') });
+  const ssAfter = path.join(C.outDir, 'after_login.png');
+  await page.screenshot({ path: ssAfter });
+  await tgPhoto(ssAfter, 'После Log in. URL: ' + currentUrl).catch(() => {});
 
   if (currentUrl.includes('/login')) {
-    // Ждём ещё — Livewire иногда делает редирект с задержкой
     try {
-      await page.waitForURL(u => !u.includes('/login'), { timeout: 15000 });
-      log('✅ Залогинен, URL:', page.url());
+      await page.waitForURL(u => !u.includes('/login'), { timeout: 10000 });
+      log('Залогинен (редирект с задержкой), URL:', page.url());
     } catch (_) {
       const bodyText = await page.locator('body').innerText().catch(() => '');
-      log('Текст после логина:', bodyText.slice(0, 200));
-      // Если нет явной ошибки — считаем что залогинены (Livewire может не редиректить)
+      log('Текст после логина:', bodyText.slice(0, 300));
       if (bodyText.includes('überprüfen') || bodyText.includes('ungültig') || bodyText.includes('falsch')) {
-        throw new Error(`Логин не удался. Проверь INBERLIN_EMAIL и INBERLIN_PASSWORD в Railway.`);
+        throw new Error('Сайт отклонил логин. Смотри скриншоты в Telegram.');
       }
-      log('✅ Залогинен (Livewire без редиректа)');
+      log('Залогинен (Livewire, URL не сменился)');
     }
   } else {
-    log('✅ Авторизован, URL:', currentUrl);
+    log('Авторизован, URL:', currentUrl);
   }
 }
 
