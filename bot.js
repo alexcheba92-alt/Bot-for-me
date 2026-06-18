@@ -99,18 +99,29 @@ function ibwBtn(url) {
 // ================================================================
 //  СООБЩЕНИЯ
 // ================================================================
+function str(v) {
+  if (!v) return '';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
 function msgNew(apt) {
+  const addr     = str(apt.address);
+  const district = str(apt.district);
+  const title    = str(apt.title);
+  const company  = str(apt.company);
+  const wbs      = str(apt.wbs);
   const lines = [
     '🏠 <b>Новая квартира!</b>',
     '',
-    apt.title    ? `<b>${apt.title}</b>`                 : null,
-    apt.address  ? `📍 ${apt.address}`                   : null,
-    apt.district ? `🗺 Район: ${apt.district}`           : null,
-    apt.rooms    ? `🛏 Комнат: <b>${apt.rooms}</b>`      : null,
-    apt.size     ? `📐 Площадь: <b>${apt.size} м²</b>`  : null,
-    apt.rent     ? `💶 Kaltmiete: <b>${apt.rent} €</b>` : null,
-    apt.company  ? `🏢 ${apt.company}`                   : null,
-    apt.wbs      ? `🔑 ${apt.wbs}`                      : null,
+    title    ? `<b>${title}</b>`                    : null,
+    addr     ? `📍 ${addr}`                         : null,
+    district ? `🗺 Район: ${district}`              : null,
+    apt.rooms? `🛏 Комнат: <b>${apt.rooms}</b>`     : null,
+    apt.size ? `📐 Площадь: <b>${apt.size} м²</b>` : null,
+    apt.rent ? `💶 Kaltmiete: <b>${apt.rent} €</b>`: null,
+    company  ? `🏢 ${company}`                      : null,
+    wbs      ? `🔑 ${wbs}`                         : null,
   ].filter(Boolean).join('\n');
   return { text: lines, markup: ibwBtn(apt.url) };
 }
@@ -288,48 +299,59 @@ async function scrapeAll() {
 async function goToNextPage(page, currentPageNum) {
   const nextNum = currentPageNum + 1;
 
-  // Логируем все ссылки пагинации для диагностики
-  const allLinks = await page.locator('a').all();
-  const linkInfo = [];
-  for (const l of allLinks) {
+  // Логируем ВСЕ кликабельные элементы — a и button
+  const allEls = await page.locator('a, button, [wire\:click]').all();
+  const elInfo = [];
+  for (const el of allEls) {
     try {
-      const t    = (await l.innerText()).trim();
-      const href = (await l.getAttribute('href') || '').trim();
-      if (t && t.length < 30) linkInfo.push(`"${t}"→${href.slice(0,40)}`);
+      const t = (await el.innerText().catch(() => '')).trim();
+      if (t && t.length < 30) elInfo.push('"' + t + '"');
     } catch (_) {}
   }
-  log('Все ссылки на странице:', linkInfo.join(' | ').slice(0, 300));
+  log('Кликабельные элементы:', elInfo.join(' | ').slice(0, 400));
 
-  // Пробуем разные варианты кнопки следующей страницы
+  // Сохраняем HTML пагинации для диагностики
+  try {
+    const html = await page.content();
+    fs.writeFileSync(path.join(C.outDir, 'pagination.html'), html);
+  } catch (_) {}
+
+  // Кандидаты — a, button и wire:click элементы
   const candidates = [
-    // По тексту
-    page.locator('a').filter({ hasText: /^Vor$/ }).first(),
-    page.locator('a').filter({ hasText: /^Vor >$/ }).first(),
+    // Livewire wire:click (сайт на Livewire!)
+    page.locator('[wire\:click]').filter({ hasText: 'Vor' }).first(),
+    page.locator('[wire\:click]').filter({ hasText: String(nextNum) }).first(),
+    // Кнопки
+    page.locator('button').filter({ hasText: /^Vor/ }).first(),
+    page.locator('button').filter({ hasText: new RegExp('^' + nextNum + '$') }).first(),
+    // Ссылки
+    page.locator('a').filter({ hasText: /^Vor/ }).first(),
+    page.locator('a').filter({ hasText: new RegExp('^' + nextNum + '$') }).first(),
     page.locator('a').filter({ hasText: /^>$/ }).first(),
     page.locator('a').filter({ hasText: /^»$/ }).first(),
-    page.locator('a').filter({ hasText: new RegExp('^' + nextNum + '$') }).first(),
     // По href
-    page.locator(`a[href*="page=${nextNum}"]`).first(),
-    page.locator(`a[href*="seite=${nextNum}"]`).first(),
-    page.locator(`a[href*="p=${nextNum}"]`).first(),
-    // По классу
-    page.locator('li.next a, .pagination-next a, a.next').first(),
-    page.locator('[class*="pagination"] a[rel="next"]').first(),
+    page.locator('a[href*="page=' + nextNum + '"]').first(),
+    page.locator('a[href*="p=' + nextNum + '"]').first(),
+    // Универсально
+    page.locator('text="Vor >"').first(),
+    page.locator('text="Vor"').first(),
+    page.locator('text="' + nextNum + '"').first(),
   ];
 
   for (const btn of candidates) {
     try {
       if (await btn.isVisible({ timeout: 800 })) {
-        const t = (await btn.innerText()).trim();
-        log(`Кнопка следующей страницы: "${t}"`);
+        const t = (await btn.innerText().catch(() => '?')).trim();
+        log('Кнопка следующей страницы найдена: "' + t + '"');
         await btn.click();
         await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
-        await page.waitForTimeout(2000);
+        await page.waitForTimeout(3000);
         return true;
       }
     } catch (_) {}
   }
 
+  log('Кнопка следующей страницы НЕ найдена. Элементы: ' + elInfo.join(' | ').slice(0, 200));
   return false;
 }
 
