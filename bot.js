@@ -276,24 +276,36 @@ async function scrapeAll() {
 
   const all = [];
   let pageNum = 1;
+  const seen = new Set();  // Дедупликация в реальном времени
 
   while (true) {
     log(`Страница ${pageNum}...`);
     const items = await parseCurrentPage();
-    log(`Страница ${pageNum}: ${items.length} квартир`);
-    all.push(...items);
+    
+    // Фильтруем дубликаты сразу же
+    const unique = [];
+    for (const a of items) {
+      const key = a.url ? a.url : String(a.address).toLowerCase().replace(/\s+/g, '');
+      if (!seen.has(key)) {
+        seen.add(key);
+        unique.push(a);
+      }
+    }
+    
+    log(`Страница ${pageNum}: ${items.length} найдено, ${unique.length} уникальных`);
+    all.push(...unique);
 
     // Ищем кнопку следующей страницы
     const hasNext = await goToNextPage(page, pageNum);
     if (!hasNext) {
-      log(`Пагинация закончилась. Всего: ${all.length}`);
+      log(`Пагинация закончилась. Всего уникальных: ${all.length}`);
       break;
     }
     pageNum++;
     if (pageNum > 10) break;
   }
 
-  return dedupe(all);
+  return all;  // Уже дедупликировано
 }
 
 async function goToNextPage(page, currentPageNum) {
