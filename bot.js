@@ -66,7 +66,11 @@ function loadState() {
     subscribers: [],
   };
 }
-function saveState(s) { fs.writeFileSync(stateFile, JSON.stringify(s, null, 2)); }
+function saveState(s) {
+  const tmp = stateFile + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+  fs.renameSync(tmp, stateFile);
+}
 let STATE = loadState();
 
 function getAllRecipients() {
@@ -297,14 +301,17 @@ function msgGone(apt) {
 // ================================================================
 //  SAFE GOTO
 // ================================================================
-async function safeGoto(page, url) {
-  try {
-    const resp = await page.goto(url, { waitUntil: 'commit', timeout: 45000 });
-    return resp;
-  } catch (e) {
-    log('GOTO ERROR:', url, e.message);
-    return null;
+async function safeGoto(page, url, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const resp = await page.goto(url, { waitUntil: 'commit', timeout: 45000 });
+      return resp;
+    } catch (e) {
+      log(`GOTO ERROR (попытка ${attempt + 1}/${retries + 1}):`, url, e.message);
+      if (attempt < retries) await sleep(2000);
+    }
   }
+  return null;
 }
 
 // ================================================================
@@ -314,14 +321,25 @@ let browser  = null;
 let ctx      = null;
 let page     = null;
 let loggedIn = false;
+let browserStartedAt = null;
+const BROWSER_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 часа
 
 async function ensureBrowser() {
+  // Раз в сутки — полный рестарт браузера, даже если он живой.
+  // Playwright/Chromium может накапливать память за недели работы.
+  if (browser && browserStartedAt && (Date.now() - browserStartedAt > BROWSER_MAX_AGE_MS)) {
+    log('Браузеру больше 24 часов — плановый перезапуск для очистки памяти');
+    try { await browser.close(); } catch (_) {}
+    browser = null; ctx = null; page = null; loggedIn = false;
+  }
+
   if (!browser || !browser.isConnected()) {
     log('Запускаю браузер...');
     browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
+    browserStartedAt = Date.now();
     ctx = null; page = null; loggedIn = false;
   }
   if (!ctx) {
@@ -855,18 +873,28 @@ async function runCheckInternal() {
     log('НОВАЯ:', apt.id);
     const { text, markup } = msgNew(apt);
     await broadcastText(text, { reply_markup: markup });
+    // Сохраняем СРАЗУ после отправки — если упадём на следующей квартире,
+    // эта уже не будет отправлена повторно при перезапуске
+    currMap[apt.id] = {
+      address: apt.address, district: apt.district,
+      rooms: apt.rooms, rent: apt.rent, size: apt.size, url: apt.url,
+    };
+    STATE.known = currMap;
+    saveState(STATE);
   }
 
   for (const apt of removed) {
     log('УШЛА:', apt.id);
     await broadcastText(msgGone(apt));
+    // Аналогично — убираем из known сразу после уведомления
+    delete currMap[apt.id];
+    STATE.known = currMap;
+    saveState(STATE);
   }
 
-  if (!STATE.firstRun && STATE.lastCount !== null &&
-      STATE.lastCount !== apartments.length &&
-      added.length === 0 && removed.length === 0) {
-    await broadcastText(`📊 Квартир: <b>${STATE.lastCount} → ${apartments.length}</b>`);
-  }
+  // Примечание: блок "количество изменилось без added/removed" убран —
+  // такая ситуация практически невозможна, т.к. если число квартир
+  // меняется, у нас почти всегда есть конкретные added или removed.
 
   STATE.known     = currMap;
   STATE.lastCount = apartments.length;
