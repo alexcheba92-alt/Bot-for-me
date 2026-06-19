@@ -15,6 +15,10 @@ const C = {
   password:   process.env.INBERLIN_PASSWORD || '',
   tgToken:    process.env.TELEGRAM_TOKEN    || '',
   tgChatId:   process.env.TELEGRAM_CHAT_ID  || '',
+  // Доп. получатели уведомлений, через запятую: "111111,222222"
+  // Можно не заполнять — тогда уведомления идут только владельцу
+  extraSubscribers: (process.env.TELEGRAM_SUBSCRIBERS || '')
+    .split(',').map(s => s.trim()).filter(Boolean),
 
   maxRent:   600,
   minRooms:  3,
@@ -64,7 +68,17 @@ function loadState() {
     known: {}, lastCount: null, firstRun: true,
     maxRent: C.maxRent, minRooms: C.minRooms,
     tgOffset: 0,
+    subscribers: [],  // chat_id людей, подписавшихся через /subscribe
   };
+}
+
+// Полный список получателей уведомлений: владелец + .env подписчики + те кто вызвал /subscribe
+function getAllRecipients() {
+  const ids = new Set();
+  ids.add(String(C.tgChatId));
+  for (const id of C.extraSubscribers) ids.add(String(id));
+  for (const id of (STATE.subscribers || [])) ids.add(String(id));
+  return Array.from(ids);
 }
 function saveState(s) { fs.writeFileSync(stateFile, JSON.stringify(s, null, 2)); }
 let STATE = loadState();
@@ -105,6 +119,35 @@ function ibwBtn(url) {
   return { inline_keyboard: [[{ text: '🔗 Открыть на inberlinwohnen.de', url }]] };
 }
 
+// Шлёт сообщение ВСЕМ подписчикам (владелец + .env список + /subscribe)
+async function broadcastText(text, extra = {}) {
+  for (const chatId of getAllRecipients()) {
+    try {
+      await axios.post(`${TG}/sendMessage`, {
+        chat_id: chatId, text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+        ...extra,
+      }, { timeout: 15000 });
+    } catch (e) { log('TG broadcast error for', chatId, ':', e.message); }
+    await sleep(150);
+  }
+}
+
+async function broadcastPhoto(filePath, caption = '') {
+  for (const chatId of getAllRecipients()) {
+    try {
+      const form = new FormData();
+      form.append('chat_id',    chatId);
+      form.append('photo',      fs.createReadStream(filePath));
+      form.append('caption',    caption.slice(0, 1024));
+      form.append('parse_mode', 'HTML');
+      await axios.post(`${TG}/sendPhoto`, form, { headers: form.getHeaders(), timeout: 30000 });
+    } catch (e) { log('TG broadcast photo error for', chatId, ':', e.message); }
+    await sleep(150);
+  }
+}
+
 // ================================================================
 //  TELEGRAM — приём команд (long polling)
 // ================================================================
@@ -127,8 +170,10 @@ function helpText() {
     '',
     '/start — приветствие и текущие настройки',
     '/status — сколько квартир сейчас по фильтру',
-    '/rooms N — минимум комнат (например: /rooms 2)',
-    '/rent N — максимальная Kaltmiete € (например: /rent 700)',
+    '/subscribe — получать уведомления о новых квартирах',
+    '/unsubscribe — отписаться от уведомлений',
+    '/rooms N — минимум комнат (только владелец)',
+    '/rent N — максимальная Kaltmiete € (только владелец)',
     '/help — это сообщение',
     '',
     `📊 Сейчас: до <b>${CURRENT.maxRent} €</b>, от <b>${CURRENT.minRooms}</b> комнат`,
@@ -174,6 +219,28 @@ async function handleCommand(text, chatId) {
     STATE.maxRent = CURRENT.maxRent;
     saveState(STATE);
     await tgText(`✅ Максимальная Kaltmiete изменена на <b>${CURRENT.maxRent} €</b>. Применится при следующей проверке.`, { chat_id: chatId });
+    return;
+  }
+
+  if (text === '/subscribe') {
+    const id = String(chatId);
+    if (!STATE.subscribers) STATE.subscribers = [];
+    if (STATE.subscribers.includes(id) || id === String(C.tgChatId)) {
+      await tgText('✅ Ты уже подписан на уведомления.', { chat_id: chatId });
+    } else {
+      STATE.subscribers.push(id);
+      saveState(STATE);
+      await tgText('✅ Подписка оформлена! Теперь будешь получать уведомления о новых квартирах.', { chat_id: chatId });
+      log('Новый подписчик:', id);
+    }
+    return;
+  }
+
+  if (text === '/unsubscribe') {
+    const id = String(chatId);
+    STATE.subscribers = (STATE.subscribers || []).filter(s => s !== id);
+    saveState(STATE);
+    await tgText('Отписка выполнена. Больше не будешь получать уведомления.', { chat_id: chatId });
     return;
   }
 
@@ -686,20 +753,18 @@ async function runCheck() {
     for (const apt of added) {
       log('НОВАЯ:', apt.id);
       const { text, markup } = msgNew(apt);
-      await tgText(text, { reply_markup: markup });
-      await sleep(700);
+      await broadcastText(text, { reply_markup: markup });
     }
 
     for (const apt of removed) {
       log('УШЛА:', apt.id);
-      await tgText(msgGone(apt));
-      await sleep(700);
+      await broadcastText(msgGone(apt));
     }
 
     if (!STATE.firstRun && STATE.lastCount !== null &&
         STATE.lastCount !== apartments.length &&
         added.length === 0 && removed.length === 0) {
-      await tgText(`📊 Квартир: <b>${STATE.lastCount} → ${apartments.length}</b>`);
+      await broadcastText(`📊 Квартир: <b>${STATE.lastCount} → ${apartments.length}</b>`);
     }
 
     STATE.known     = currMap;
