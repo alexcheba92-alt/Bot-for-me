@@ -426,12 +426,25 @@ function isJunkUrl(url) {
   if (!url) return true;
   if (url === C.baseUrl || url === C.baseUrl + '/') return true;
   if (url === C.finderUrl) return true;
+  if (url.endsWith('/mein-bereich') || url.endsWith('/mein-bereich/')) return true;
+
   const junkPaths = ['/support', '/account', '/profil', '/sicherheit', '/datenschutz',
                      '/impressum', '/kontakt', '/startseite', '/tauschportal',
-                     '/mein-bereich$', '/login', '/logout', '/agb'];
+                     '/login', '/logout', '/agb'];
   for (const j of junkPaths) {
     if (url.includes(j)) return true;
   }
+  return false;
+}
+
+// Положительный признак реальной квартиры — точный паттерн объявлений HOWOGE и т.п.
+function isApartmentUrl(url) {
+  if (!url) return false;
+  if (isJunkUrl(url)) return false;
+  // Известный паттерн: /wohnungssuche/detail/1770-20506-16.html
+  if (/\/detail\/[\w-]+/i.test(url)) return true;
+  // Запасной паттерн: длинный числовой ID в пути
+  if (/\d{4,}/.test(url) && (/expose|objekt|wohnung|apartment/i.test(url))) return true;
   return false;
 }
 
@@ -449,16 +462,19 @@ async function scrapeAll() {
   while (true) {
     log(`Страница ${pageNum}...`);
 
-    // Подпись текущей страницы — для проверки что контент реально сменился
-    const pageSignature = await page.locator('body').innerText().catch(() => '');
-    const sigShort = pageSignature.slice(0, 300);
+    const items = await parseCurrentPage();
+
+    // Подпись страницы — URL + отсортированный список найденных квартирных ссылок.
+    // Надёжнее чем текст body: меню сайта одинаковое на всех страницах,
+    // а вот набор реальных квартир должен отличаться.
+    const currentUrl = page.url();
+    const urlsOnPage = items.map(a => a.url).filter(Boolean).sort().join('|');
+    const sigShort = currentUrl + '::' + urlsOnPage;
 
     if (lastPageSignature !== null && sigShort === lastPageSignature) {
-      log('Содержимое страницы не изменилось с прошлого шага — останавливаюсь, чтобы не дублировать.');
+      log('Страница идентична предыдущей (тот же URL и тот же набор квартир) — останавливаюсь.');
       break;
     }
-
-    const items = await parseCurrentPage();
 
     let newOnPage = 0;
     for (const a of items) {
@@ -520,6 +536,27 @@ async function goToNextPage(page, currentPageNum) {
 
       const visible = await el.isVisible({ timeout: 500 }).catch(() => false);
       if (!visible) continue;
+
+      // Доп. проверка: если это номер страницы, убеждаемся что это похоже на
+      // пагинацию — есть href с числом, или родитель содержит другие номера
+      // страниц рядом (например "1 2 3 Vor"), а не случайная "2" в тексте сайта.
+      if (t === String(nextNum)) {
+        const href = await el.getAttribute('href').catch(() => null);
+        const looksLikePagination = href
+          ? /page|seite|p=/i.test(href) || /\d/.test(href)
+          : await el.evaluate(node => {
+              const parent = node.closest('ul, nav, div');
+              if (!parent) return false;
+              const siblingText = parent.innerText || '';
+              // Похоже на пагинацию если рядом есть другие маленькие числа
+              const nums = siblingText.match(/\b\d{1,3}\b/g) || [];
+              return nums.length >= 2;
+            }).catch(() => false);
+        if (!looksLikePagination) {
+          log(`Пропускаю "${t}" — не похоже на кнопку пагинации (нет признаков рядом)`);
+          continue;
+        }
+      }
 
       log('Кнопка следующей страницы найдена: "' + t + '"');
       await el.click();
@@ -649,6 +686,18 @@ function parseAptText(text) {
 async function findLink(el) {
   try {
     const links = await el.locator('a[href]').all();
+
+    // Приоритет 1: точный паттерн /detail/ID — это формат реальных объявлений
+    // (например HOWOGE: /wohnungssuche/detail/1770-20506-16.html)
+    for (const link of links) {
+      const href = (await link.getAttribute('href') || '').trim();
+      if (!href || href === '#') continue;
+      const full = href.startsWith('http') ? href : C.baseUrl + href;
+      if (isJunkUrl(full)) continue;
+      if (/\/detail\/[\w-]+/i.test(href)) return full;
+    }
+
+    // Приоритет 2: запасные паттерны (длинное число + ключевое слово)
     for (const link of links) {
       const href = (await link.getAttribute('href') || '').trim();
       if (!href || href === '#') continue;
@@ -658,6 +707,8 @@ async function findLink(el) {
         return full;
       }
     }
+
+    // Приоритет 3: любая непустая не-мусорная ссылка
     for (const link of links) {
       const href = (await link.getAttribute('href') || '').trim();
       if (!href || href === '#' || href.startsWith('mailto') || href.startsWith('tel')) continue;
