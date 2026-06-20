@@ -91,9 +91,28 @@ let CURRENT = {
 // ================================================================
 const TG = `https://api.telegram.org/bot${C.tgToken}`;
 
+// Универсальная отправка POST в Telegram с обработкой 429 (Too Many Requests).
+// Если Telegram просит подождать (retry_after), ждём и пробуем снова.
+async function tgPostWithRetry(url, payload, opts = {}, maxRetries = 3) {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await axios.post(url, payload, opts);
+    } catch (e) {
+      const status = e.response?.status;
+      if (status === 429 && attempt < maxRetries) {
+        const retryAfter = e.response?.data?.parameters?.retry_after || 3;
+        log(`TG 429 Flood control — жду ${retryAfter} сек (попытка ${attempt + 1}/${maxRetries})`);
+        await sleep((retryAfter + 1) * 1000);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
 async function tgText(text, extra = {}) {
   try {
-    await axios.post(`${TG}/sendMessage`, {
+    await tgPostWithRetry(`${TG}/sendMessage`, {
       text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
@@ -110,7 +129,7 @@ async function tgPhoto(filePath, caption = '', chatId = C.tgChatId) {
     form.append('photo',      fs.createReadStream(filePath));
     form.append('caption',    caption.slice(0, 1024));
     form.append('parse_mode', 'HTML');
-    await axios.post(`${TG}/sendPhoto`, form, { headers: form.getHeaders(), timeout: 30000 });
+    await tgPostWithRetry(`${TG}/sendPhoto`, form, { headers: form.getHeaders(), timeout: 30000 });
   } catch (e) { log('TG photo error:', e.message); }
 }
 
@@ -121,7 +140,7 @@ function ibwBtn(url) {
 async function broadcastText(text, extra = {}) {
   for (const chatId of getAllRecipients()) {
     try {
-      await axios.post(`${TG}/sendMessage`, {
+      await tgPostWithRetry(`${TG}/sendMessage`, {
         text,
         parse_mode: 'HTML',
         disable_web_page_preview: true,
@@ -333,6 +352,18 @@ async function ensureBrowser() {
     browser = null; ctx = null; page = null; loggedIn = false;
   }
 
+  // Защита от "Target page, context or browser has been closed" —
+  // Chromium иногда падает сам по себе, страница/контекст остаются
+  // в переменных но реально уже не существуют
+  if (page && page.isClosed()) {
+    log('Страница оказалась закрыта (вероятно краш Chromium) — сбрасываю сессию');
+    ctx = null; page = null; loggedIn = false;
+  }
+  if (browser && !browser.isConnected()) {
+    log('Браузер отключён (вероятно краш) — сбрасываю всё');
+    browser = null; ctx = null; page = null; loggedIn = false;
+  }
+
   if (!browser || !browser.isConnected()) {
     log('Запускаю браузер...');
     browser = await chromium.launch({
@@ -461,7 +492,10 @@ function isApartmentUrl(url) {
   if (isJunkUrl(url)) return false;
   // Известный паттерн: /wohnungssuche/detail/1770-20506-16.html
   if (/\/detail\/[\w-]+/i.test(url)) return true;
-  // Запасной паттерн: длинный числовой ID в пути
+  // Запасной паттерн 1: путь содержит /wohnungssuche/ — каталог реальных объявлений,
+  // надёжнее искать так на случай если сайт уберёт /detail/ из структуры
+  if (/\/wohnungssuche\//i.test(url)) return true;
+  // Запасной паттерн 2: длинный числовой ID в пути
   if (/\d{4,}/.test(url) && (/expose|objekt|wohnung|apartment/i.test(url))) return true;
   return false;
 }
@@ -622,7 +656,11 @@ async function parseCurrentPage() {
   const result = [];
 
   const ssPath = path.join(C.outDir, 'results.png');
-  if (!fs.existsSync(ssPath)) {
+  // Обновляем скриншот раз в сутки, а не один раз навсегда —
+  // если сайт изменит вёрстку, мы это увидим
+  const ssIsStale = !fs.existsSync(ssPath) ||
+    (Date.now() - fs.statSync(ssPath).mtimeMs > 24 * 60 * 60 * 1000);
+  if (ssIsStale) {
     await page.screenshot({ path: ssPath, fullPage: false });
   }
 
@@ -713,6 +751,16 @@ async function findLink(el) {
       const full = href.startsWith('http') ? href : C.baseUrl + href;
       if (isJunkUrl(full)) continue;
       if (/\/detail\/[\w-]+/i.test(href)) return full;
+    }
+
+    // Приоритет 1.5: запасной — каталог /wohnungssuche/ без /detail/
+    // (на случай изменения структуры URL сайтом)
+    for (const link of links) {
+      const href = (await link.getAttribute('href') || '').trim();
+      if (!href || href === '#') continue;
+      const full = href.startsWith('http') ? href : C.baseUrl + href;
+      if (isJunkUrl(full)) continue;
+      if (/\/wohnungssuche\//i.test(href)) return full;
     }
 
     // Приоритет 2: запасные паттерны (длинное число + ключевое слово)
@@ -828,10 +876,10 @@ async function runCheckInternal() {
   await ensureBrowser();
   await ensureLoggedIn();
 
-  const ssPath = path.join(C.outDir, 'results.png');
-  if (fs.existsSync(ssPath)) fs.unlinkSync(ssPath);
-
+  // Скриншот теперь обновляется автоматически раз в сутки (см. parseCurrentPage),
+  // принудительное удаление здесь больше не нужно
   const apartments = await scrapeAll();
+
 
   apartments.slice(0, 5).forEach((a, i) =>
     log(`[${i}] rooms=${a.rooms} rent=${a.rent}€ size=${a.size}m² | ${a.address} | ${a.url.slice(0, 70)}`)
@@ -942,19 +990,53 @@ async function checkLoop() {
   }
 }
 
+// ================================================================
+//  LOCK-ФАЙЛ — защита от двойного запуска
+//  Если процесс уже работает, новый экземпляр не стартует
+//  и не будет слать дублирующиеся уведомления
+// ================================================================
+const lockFile = path.join(C.outDir, 'bot.lock');
+
+function acquireLock() {
+  if (fs.existsSync(lockFile)) {
+    const oldPid = fs.readFileSync(lockFile, 'utf8').trim();
+    // Проверяем жив ли процесс со старым PID (актуально для VPS;
+    // на Railway процессы переживают рестарт контейнера редко,
+    // но проверка не вредит)
+    try {
+      process.kill(Number(oldPid), 0); // не убивает, просто проверяет существование
+      console.error(`❌ Бот уже запущен (PID ${oldPid}). Завершаю, чтобы не дублировать уведомления.`);
+      process.exit(1);
+    } catch (_) {
+      // Процесс с этим PID не существует — старый lock устарел, перезаписываем
+      log('Найден устаревший lock-файл (процесс не существует), перезаписываю');
+    }
+  }
+  fs.writeFileSync(lockFile, String(process.pid));
+}
+
+function releaseLock() {
+  try { if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile); } catch (_) {}
+}
+
 async function main() {
   checkConfig();
+  acquireLock();
   log('=== Бот inberlinwohnen.de ===');
 
   startTelegramPolling();
   await checkLoop();
 }
 
-process.on('SIGINT',  async () => { log('SIGINT');  try { await browser?.close(); } catch (_) {} process.exit(0); });
-process.on('SIGTERM', async () => { log('SIGTERM'); try { await browser?.close(); } catch (_) {} process.exit(0); });
+process.on('SIGINT',  async () => { log('SIGINT');  releaseLock(); try { await browser?.close(); } catch (_) {} process.exit(0); });
+process.on('SIGTERM', async () => { log('SIGTERM'); releaseLock(); try { await browser?.close(); } catch (_) {} process.exit(0); });
 process.on('uncaughtException', async (e) => {
   log('UNCAUGHT:', e.stack);
   try { await tgText(`💥 Критическая ошибка:\n<code>${e.message}</code>`); } catch (_) {}
+});
+process.on('unhandledRejection', async (reason) => {
+  log('UNHANDLED REJECTION:', reason instanceof Error ? reason.stack : String(reason));
+  try { await tgText(`💥 Необработанная ошибка промиса:\n<code>${String(reason).slice(0, 300)}</code>`); } catch (_) {}
 });
 
 main().catch(async e => {
