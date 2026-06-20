@@ -222,7 +222,7 @@ async function handleCommand(text, chatId) {
     if (!isOwner) { await tgText('⛔ Эта команда доступна только владельцу бота.', { chat_id: chatId }); return; }
     CURRENT.minRooms = parseInt(roomsMatch[1], 10);
     STATE.minRooms = CURRENT.minRooms;
-    saveState(STATE);
+    await saveState(STATE);
     await tgText(`✅ Минимум комнат изменён на <b>${CURRENT.minRooms}</b>.`, { chat_id: chatId });
     return;
   }
@@ -232,7 +232,7 @@ async function handleCommand(text, chatId) {
     if (!isOwner) { await tgText('⛔ Эта команда доступна только владельцу бота.', { chat_id: chatId }); return; }
     CURRENT.maxRent = parseInt(rentMatch[1], 10);
     STATE.maxRent = CURRENT.maxRent;
-    saveState(STATE);
+    await saveState(STATE);
     await tgText(`✅ Максимальная Kaltmiete изменена на <b>${CURRENT.maxRent} €</b>.`, { chat_id: chatId });
     return;
   }
@@ -244,7 +244,7 @@ async function handleCommand(text, chatId) {
       await tgText('✅ Ты уже подписан на уведомления.', { chat_id: chatId });
     } else {
       STATE.subscribers.push(id);
-      saveState(STATE);
+      await saveState(STATE);
       await tgText('✅ Подписка оформлена!', { chat_id: chatId });
       log('Новый подписчик:', id);
     }
@@ -254,7 +254,7 @@ async function handleCommand(text, chatId) {
   if (text === '/unsubscribe') {
     const id = String(chatId);
     STATE.subscribers = (STATE.subscribers || []).filter(s => s !== id);
-    saveState(STATE);
+    await saveState(STATE);
     await tgText('Отписка выполнена.', { chat_id: chatId });
     return;
   }
@@ -273,7 +273,7 @@ async function pollTelegramOnce() {
     log('TG входящее:', msg.chat.id, msg.text);
     await handleCommand(msg.text.trim(), msg.chat.id).catch(e => log('handleCommand error:', e.message));
   }
-  if (updates.length > 0) saveState(STATE);
+  if (updates.length > 0) await saveState(STATE);
 }
 
 async function startTelegramPolling() {
@@ -406,6 +406,24 @@ async function resetSession() {
   log('Сбрасываю сессию...');
   try { if (ctx) await ctx.close(); } catch (_) {}
   ctx = null; page = null; loggedIn = false;
+}
+
+// Обёртка для операций с браузером — если Chromium умер посреди клика/перехода
+// (например "Target page, context or browser has been closed"), сразу сбрасываем
+// сессию, чтобы следующая попытка стартовала с чистого листа, а не билась
+// в тот же мёртвый объект
+async function safeAction(fn) {
+  try {
+    return await fn();
+  } catch (e) {
+    const msg = e.message || '';
+    if (msg.includes('Target page') || msg.includes('has been closed') ||
+        msg.includes('Target closed') || msg.includes('Browser has been closed')) {
+      log('Обнаружен краш браузера посреди операции — сбрасываю сессию:', msg.slice(0, 100));
+      await resetSession();
+    }
+    throw e;
+  }
 }
 
 // ================================================================
@@ -904,12 +922,19 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 let errCount = 0;
 
 async function runCheckInternal() {
-  await ensureBrowser();
-  await ensureLoggedIn();
+  const t0 = Date.now();
+  await safeAction(() => ensureBrowser());
+  log(`[timing] ensureBrowser: ${Date.now() - t0}ms`);
+
+  const t1 = Date.now();
+  await safeAction(() => ensureLoggedIn());
+  log(`[timing] ensureLoggedIn: ${Date.now() - t1}ms`);
 
   // Скриншот теперь обновляется автоматически раз в сутки (см. parseCurrentPage),
   // принудительное удаление здесь больше не нужно
-  const apartments = await scrapeAll();
+  const t2 = Date.now();
+  const apartments = await safeAction(() => scrapeAll());
+  log(`[timing] scrapeAll: ${Date.now() - t2}ms`);
 
   // ═══════════════════════════════════════════════════════════════
   // КРИТИЧЕСКАЯ ЗАЩИТА: если нашли 0 квартир, а до этого было
@@ -982,7 +1007,7 @@ async function runCheckInternal() {
       rooms: apt.rooms, rent: apt.rent, size: apt.size, url: apt.url,
     };
     STATE.known = currMap;
-    saveState(STATE);
+    await saveState(STATE);
   }
 
   for (const apt of removed) {
@@ -991,7 +1016,7 @@ async function runCheckInternal() {
     // Аналогично — убираем из known сразу после уведомления
     delete currMap[apt.id];
     STATE.known = currMap;
-    saveState(STATE);
+    await saveState(STATE);
   }
 
   // Примечание: блок "количество изменилось без added/removed" убран —
@@ -1000,13 +1025,13 @@ async function runCheckInternal() {
 
   STATE.known     = currMap;
   STATE.lastCount = apartments.length;
-  saveState(STATE);
+  await saveState(STATE);
   errCount = 0;
 }
 
 // ================================================================
 //  ОБЁРТКА С ГЛОБАЛЬНЫМ ТАЙМАУТОМ
-//  Если проверка зависнет дольше 2 минут — прерываем и сбрасываем сессию,
+//  Если проверка зависнет дольше 3 минут — прерываем и сбрасываем сессию,
 //  не висим вечно
 // ================================================================
 async function runCheck() {
@@ -1015,7 +1040,7 @@ async function runCheck() {
     await Promise.race([
       runCheckInternal(),
       new Promise((_, reject) => {
-        timeoutHandle = setTimeout(() => reject(new Error('Проверка зависла дольше 2 минут')), 120000);
+        timeoutHandle = setTimeout(() => reject(new Error('Проверка зависла дольше 3 минут')), 180000);
       }),
     ]);
   } catch (e) {
@@ -1038,6 +1063,31 @@ async function runCheck() {
 // ================================================================
 let isChecking = false;
 
+// ================================================================
+//  ЕЖЕДНЕВНЫЙ HEALTH-CHECK — чтобы видеть что бот жив, а не просто молчит
+// ================================================================
+const botStartedAt = Date.now();
+let checksRun = 0;
+let lastHealthReportAt = Date.now();
+const HEALTH_REPORT_INTERVAL_MS = 24 * 60 * 60 * 1000; // раз в сутки
+
+async function maybeSendHealthReport() {
+  if (Date.now() - lastHealthReportAt < HEALTH_REPORT_INTERVAL_MS) return;
+  lastHealthReportAt = Date.now();
+
+  const uptimeMs = Date.now() - botStartedAt;
+  const uptimeDays = (uptimeMs / (24 * 60 * 60 * 1000)).toFixed(1);
+  const memMb = (process.memoryUsage().rss / 1024 / 1024).toFixed(0);
+
+  await tgText(
+    `✅ <b>Бот жив</b>\n\n` +
+    `Проверок выполнено: ${checksRun}\n` +
+    `Квартир сейчас: ${STATE.lastCount ?? '—'}\n` +
+    `Память: ${memMb} MB\n` +
+    `Uptime: ${uptimeDays} дней`
+  ).catch(() => {});
+}
+
 async function checkLoop() {
   while (true) {
     if (isChecking) {
@@ -1048,9 +1098,11 @@ async function checkLoop() {
     isChecking = true;
     try {
       await runCheck();
+      checksRun++;
     } finally {
       isChecking = false;
     }
+    await maybeSendHealthReport();
     log(`Жду ${C.intervalMs / 60000} мин до следующей проверки...`);
     await sleep(C.intervalMs);
   }
