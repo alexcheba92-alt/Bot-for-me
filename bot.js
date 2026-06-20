@@ -66,10 +66,16 @@ function loadState() {
     subscribers: [],
   };
 }
+// Все вызовы saveState идут через очередь — это защищает от гонки,
+// когда checkLoop() и pollTelegramOnce() пишут state.json одновременно
+let saveQueue = Promise.resolve();
 function saveState(s) {
-  const tmp = stateFile + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
-  fs.renameSync(tmp, stateFile);
+  saveQueue = saveQueue.then(() => {
+    const tmp = stateFile + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(s, null, 2));
+    fs.renameSync(tmp, stateFile);
+  }).catch(e => log('saveState error:', e.message));
+  return saveQueue;
 }
 let STATE = loadState();
 
@@ -271,9 +277,20 @@ async function pollTelegramOnce() {
 }
 
 async function startTelegramPolling() {
+  let consecutiveErrors = 0;
+  const backoffSteps = [2000, 4000, 8000, 16000, 30000]; // 2s → 30s максимум
+
   while (true) {
-    await pollTelegramOnce().catch(e => log('poll error:', e.message));
-    await sleep(2000);
+    try {
+      await pollTelegramOnce();
+      consecutiveErrors = 0;
+      await sleep(2000);
+    } catch (e) {
+      consecutiveErrors++;
+      const delay = backoffSteps[Math.min(consecutiveErrors - 1, backoffSteps.length - 1)];
+      log(`poll error (подряд ${consecutiveErrors}):`, e.message, `— жду ${delay / 1000}с`);
+      await sleep(delay);
+    }
   }
 }
 
@@ -456,8 +473,22 @@ async function ensureLoggedIn() {
     else {
       const url = page.url();
       if (url.includes('/login')) {
-        log('Сессия истекла, перелогиниваюсь...');
+        log('Сессия истекла (редирект на /login), перелогиниваюсь...');
         loggedIn = false;
+      } else {
+        // Дополнительная проверка: страница должна реально содержать
+        // что-то похожее на форму поиска или результаты, а не быть пустой
+        // или страницей ошибки без редиректа на /login
+        await page.waitForTimeout(1500);
+        const bodyText = await page.locator('body').innerText().catch(() => '');
+        const looksValid = bodyText.length > 200 &&
+          (bodyText.includes('Zimmer') || bodyText.includes('Wohnungsfinder') ||
+           bodyText.includes('Wohnungssuche') || bodyText.includes('Angebote') ||
+           bodyText.includes('Mein inberlinwohnen'));
+        if (!looksValid) {
+          log(`Страница finder выглядит подозрительно (длина текста: ${bodyText.length}) — перелогиниваюсь на всякий случай`);
+          loggedIn = false;
+        }
       }
     }
   }
@@ -880,6 +911,29 @@ async function runCheckInternal() {
   // принудительное удаление здесь больше не нужно
   const apartments = await scrapeAll();
 
+  // ═══════════════════════════════════════════════════════════════
+  // КРИТИЧЕСКАЯ ЗАЩИТА: если нашли 0 квартир, а до этого было
+  // разумное количество — это почти наверняка сбой парсинга
+  // (сессия истекла молча, сайт отдал пустую страницу, верстка
+  // изменилась), А НЕ реальное исчезновение всех объявлений сразу.
+  // Без этой защиты бот разослал бы "все квартиры пропали".
+  // ═══════════════════════════════════════════════════════════════
+  const prevCount = STATE.lastCount || 0;
+  if (apartments.length === 0 && prevCount >= 3) {
+    log(`⚠️ ПОДОЗРИТЕЛЬНО: нашли 0 квартир, хотя в прошлый раз было ${prevCount}. ` +
+        `Похоже на сбой парсинга, а не реальное исчезновение. Пропускаю уведомления, ` +
+        `форсирую релогин на следующей попытке.`);
+    await tgText(
+      `⚠️ Подозрительный результат: 0 квартир найдено (было ${prevCount}).\n` +
+      `Похоже на сбой сканирования, а не реальное изменение на сайте.\n` +
+      `Уведомления о пропавших квартирах пропущены, пробую снова через 5 минут.`
+    ).catch(() => {});
+    // Форсируем релогин на следующей попытке — возможно сессия молча умерла
+    loggedIn = false;
+    // НЕ обновляем STATE.known и STATE.lastCount — следующая успешная
+    // проверка сравнится с последним ВАЛИДНЫМ состоянием, а не с нулём
+    return;
+  }
 
   apartments.slice(0, 5).forEach((a, i) =>
     log(`[${i}] rooms=${a.rooms} rent=${a.rent}€ size=${a.size}m² | ${a.address} | ${a.url.slice(0, 70)}`)
@@ -982,9 +1036,21 @@ async function runCheck() {
 // ================================================================
 //  СТАРТ
 // ================================================================
+let isChecking = false;
+
 async function checkLoop() {
   while (true) {
-    await runCheck();
+    if (isChecking) {
+      log('⚠️ Предыдущая проверка ещё идёт — пропускаю цикл (защита от параллельных запусков)');
+      await sleep(5000);
+      continue;
+    }
+    isChecking = true;
+    try {
+      await runCheck();
+    } finally {
+      isChecking = false;
+    }
     log(`Жду ${C.intervalMs / 60000} мин до следующей проверки...`);
     await sleep(C.intervalMs);
   }
