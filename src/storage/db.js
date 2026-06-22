@@ -285,6 +285,15 @@ function getTopDistricts(limit = 10) {
 // Одноразовая очистка: убирает уже существующие в базе "битые" записи
 // квартир без id/address — могли накопиться из-за прошлых багов парсинга
 // до того как появилась валидация в monitor/scanner.js
+// Полный сброс таблицы квартир — используется один раз после критичных
+// изменений в парсере (например, баг с неправильным rooms=1 для всех
+// квартир), чтобы следующая проверка пересохранила всё с нуля корректно
+function resetApartmentsTable() {
+  const result = db.prepare('DELETE FROM apartments').run();
+  log.info(`Сброшена таблица apartments: удалено ${result.changes} записей`);
+  return result.changes;
+}
+
 function cleanupJunkApartments() {
   const result = db.prepare(`
     DELETE FROM apartments WHERE id IS NULL OR id = '' OR (address IS NULL AND district IS NULL)
@@ -301,6 +310,6 @@ module.exports = {
   ensureOwner, getUser, upsertUser, getAllSubscribedUsers, getAllUsers, touchUserLastSeen,
   upsertApartment, getApartment, getAllKnownApartmentIds, deleteApartment, pruneGoneApartments,
   wasNotified, markNotified, pruneOldNotifications, wasApartmentEverNotified,
-  cleanupJunkApartments,
+  cleanupJunkApartments, resetApartmentsTable,
   recordStatTick, getLatestStats, getTopDistricts,
 };
