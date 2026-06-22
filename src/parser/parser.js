@@ -41,13 +41,14 @@ function extractCompany(text) {
 // Парсит текст карточки квартиры.
 // Формат сайта: "3.0 Zimmer, 70,28 m², 466,94 € | Straße 32, 12559 Berlin"
 function parseAptText(text) {
-  // Расширенный поиск комнат — несколько вариантов формата на случай
-  // если текст пришёл из родительского блока (метод B) с другой структурой
+  // Поиск комнат — паттерны привязаны к полному слову "Zimmer".
+  // Короткий паттерн "Zi." убран: он ловил случайные совпадения в тексте
+  // меню/копирайта (© OpenStreetMap и т.п.), который попадает в parentText
+  // метода B, и давал ложное rooms=1 для всех квартир подряд.
   const roomsMatch =
     text.match(/(\d+(?:[.,]\d+)?)\s*(?:1\/2-)?Zimmer/i) ||
     text.match(/(\d+(?:[.,]\d+)?)-Zimmer/i) ||
-    text.match(/Zimmer[:\s]+(\d+(?:[.,]\d+)?)/i) ||
-    text.match(/(\d+(?:[.,]\d+)?)\s*Zi\.?\b/i);
+    text.match(/Zimmer[:\s]+(\d+(?:[.,]\d+)?)/i);
   const rooms = roomsMatch ? toFloat(roomsMatch[1]) : null;
 
   const sizeMatch = text.match(/(\d+(?:[,.]?\d+)?)\s*m²/i);
