@@ -15,6 +15,15 @@ async function main() {
   acquireLock();
   db.ensureOwner();
   db.cleanupJunkApartments(); // чистим мусор, накопленный до исправления валидации
+
+  // Одноразовый сброс после фикса бага с неправильным rooms=1 для всех квартир
+  // (regex "Zi\." ловил случайный текст из меню/копирайта). Срабатывает только
+  // один раз — флаг в kv_settings не даст повториться при следующих перезапусках.
+  if (!db.getKv('roomsBugFixApplied_2026_06_22', false)) {
+    db.resetApartmentsTable();
+    db.setKv('roomsBugFixApplied_2026_06_22', true);
+    log.info('Применён одноразовый сброс базы квартир после фикса парсинга комнат');
+  }
   log.info('=== Бот inberlinwohnen.de запущен (модульная версия) ===');
 
   startPolling(); // не await — работает в фоне параллельно с checkLoop
