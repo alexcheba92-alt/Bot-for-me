@@ -97,8 +97,24 @@ async function runCheckInternal() {
   );
 
   const currentIds = validApartments.map(a => a.id);
-  const newApts    = validApartments.filter(a => !db.getApartment(a.id));
-  const goneApts    = db.pruneGoneApartments(currentIds)
+
+  // ── Определяем "новые" квартиры ──
+  // Раньше критерием было "не в таблице apartments". Но если процесс
+  // упал ПОСЛЕ записи в базу, но ДО отправки уведомления (например,
+  // как в случае таймаута в 6 утра), квартира оказывается в базе
+  // без единого уведомления — и навсегда считается "старой".
+  // Теперь дополнительно проверяем: была ли реально отправка хотя бы
+  // одному подписчику. Если нет — считаем квартиру новой, даже если
+  // она уже есть в таблице apartments.
+  const newApts = validApartments.filter(a => {
+    const inDb = !!db.getApartment(a.id);
+    if (!inDb) return true; // точно новая, в базе не было вообще
+    // в базе есть, но проверим — отправляли ли хоть раз уведомление о ней
+    const everNotified = db.wasApartmentEverNotified(a.id);
+    return !everNotified;
+  });
+
+  const goneApts = db.pruneGoneApartments(currentIds)
     .filter(a => a.address || a.url); // не уведомляем о "пропаже" совсем пустых записей (старый мусор в базе)
 
   for (const a of validApartments) db.upsertApartment(a);
