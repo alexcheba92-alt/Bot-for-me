@@ -78,17 +78,32 @@ async function runCheckInternal() {
     return;
   }
 
-  apartments.slice(0, 5).forEach((a, i) =>
-    log.debug(`[${i}] rooms=${a.rooms} rent=${a.rent}€ size=${a.size}m² | ${a.address} | ${a.url.slice(0, 70)}`)
+  // ── Валидация: квартира без URL непригодна для уведомлений и дедупа.
+  //     Раньше такие записи могли попасть в базу и потом прийти как
+  //     "ушла" без адреса/ссылки. Отсекаем их здесь, до сохранения. ──
+  const validApartments = apartments.filter(a => {
+    if (!a.url || !a.id) {
+      log.warn('Квартира без URL отброшена (не сохраняется в базу):', JSON.stringify(a).slice(0, 150));
+      return false;
+    }
+    return true;
+  });
+  if (validApartments.length !== apartments.length) {
+    log.warn(`Отброшено ${apartments.length - validApartments.length} квартир без URL из ${apartments.length}`);
+  }
+
+  validApartments.slice(0, 5).forEach((a, i) =>
+    log.debug(`[${i}] rooms=${a.rooms} rent=${a.rent}€ size=${a.size}m² | ${a.address} | ${(a.url || '').slice(0, 70)}`)
   );
 
-  const currentIds = apartments.map(a => a.id);
-  const newApts    = apartments.filter(a => !db.getApartment(a.id));
-  const goneApts    = db.pruneGoneApartments(currentIds); // удаляет из базы и возвращает удалённые
+  const currentIds = validApartments.map(a => a.id);
+  const newApts    = validApartments.filter(a => !db.getApartment(a.id));
+  const goneApts    = db.pruneGoneApartments(currentIds)
+    .filter(a => a.address || a.url); // не уведомляем о "пропаже" совсем пустых записей (старый мусор в базе)
 
-  for (const a of apartments) db.upsertApartment(a);
+  for (const a of validApartments) db.upsertApartment(a);
 
-  log.info(`Итого: ${apartments.length} | Новых: ${newApts.length} | Ушло: ${goneApts.length}`);
+  log.info(`Итого: ${validApartments.length} | Новых: ${newApts.length} | Ушло: ${goneApts.length}`);
 
   const isFirstRun = db.getKv('firstRunDone', false) === false;
 
@@ -101,11 +116,11 @@ async function runCheckInternal() {
       `💶 Kaltmiete до ${owner.maxRent} €\n` +
       `🛏 Комнат от ${owner.minRooms}\n` +
       `⏱ Каждые ${C.intervalMs / 60000} мин\n\n` +
-      `📊 Сейчас по фильтру: <b>${apartments.length} квартир</b>\n\n` +
+      `📊 Сейчас по фильтру: <b>${validApartments.length} квартир</b>\n\n` +
       `Команды: /help`
     );
     const ssPath = path.join(C.outDir, 'results.png');
-    if (fs.existsSync(ssPath)) await tgPhoto(C.tgChatId, ssPath, `Страница поиска (${apartments.length} квартир)`);
+    if (fs.existsSync(ssPath)) await tgPhoto(C.tgChatId, ssPath, `Страница поиска (${validApartments.length} квартир)`);
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -137,7 +152,7 @@ async function runCheckInternal() {
     }
   }
 
-  db.setKv('lastTotalCount', apartments.length);
+  db.setKv('lastTotalCount', validApartments.length);
   db.pruneOldNotifications();
   errCount = 0;
 }
