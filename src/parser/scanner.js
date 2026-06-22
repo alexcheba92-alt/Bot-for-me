@@ -139,6 +139,25 @@ async function parseMethodB(page) {
 
 // Парсит текущую страницу: пробует метод A, при пустом результате — метод B (fallback)
 async function parseCurrentPage(page) {
+  // Сайт рендерит карточки через Livewire (AJAX) ПОСЛЕ начальной загрузки —
+  // на странице временно виден "Loading..." плейсхолдер. networkidle не
+  // гарантирует что контент уже отрисован. Явно ждём появления текста
+  // "Zimmer" или "€" в теле страницы, иначе оба метода парсинга получают
+  // пустую/неполную DOM и результат становится нестабильным между прогонами.
+  try {
+    await page.waitForFunction(
+      () => {
+        const body = document.body.innerText || '';
+        return body.includes('Zimmer') || body.includes('€');
+      },
+      { timeout: 15000 }
+    );
+  } catch (_) {
+    log.warn('Контент с квартирами не появился за 15 сек — продолжаю как есть');
+  }
+  // Небольшая доп. пауза — даём дорисоваться всем карточкам, не только первой
+  await page.waitForTimeout(800);
+
   const ssPath = path.join(C.outDir, 'results.png');
   const ssIsStale = !fs.existsSync(ssPath) ||
     (Date.now() - fs.statSync(ssPath).mtimeMs > 24 * 60 * 60 * 1000);
