@@ -14,6 +14,7 @@ async function main() {
   checkConfig();
   acquireLock();
   db.ensureOwner();
+  db.cleanupJunkApartments(); // чистим мусор, накопленный до исправления валидации
   log.info('=== Бот inberlinwohnen.de запущен (модульная версия) ===');
 
   startPolling(); // не await — работает в фоне параллельно с checkLoop
