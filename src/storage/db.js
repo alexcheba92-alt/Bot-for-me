@@ -264,11 +264,25 @@ function getTopDistricts(limit = 10) {
   `).all(limit);
 }
 
+// Одноразовая очистка: убирает уже существующие в базе "битые" записи
+// квартир без id/address — могли накопиться из-за прошлых багов парсинга
+// до того как появилась валидация в monitor/scanner.js
+function cleanupJunkApartments() {
+  const result = db.prepare(`
+    DELETE FROM apartments WHERE id IS NULL OR id = '' OR (address IS NULL AND district IS NULL)
+  `).run();
+  if (result.changes > 0) {
+    log.info(`Очищено ${result.changes} битых записей квартир из базы`);
+  }
+  return result.changes;
+}
+
 module.exports = {
   db,
   getKv, setKv,
   ensureOwner, getUser, upsertUser, getAllSubscribedUsers, getAllUsers, touchUserLastSeen,
   upsertApartment, getApartment, getAllKnownApartmentIds, deleteApartment, pruneGoneApartments,
   wasNotified, markNotified, pruneOldNotifications,
+  cleanupJunkApartments,
   recordStatTick, getLatestStats, getTopDistricts,
 };
