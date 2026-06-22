@@ -131,6 +131,10 @@ async function parseMethodB(page) {
       if (!apt) continue;
       apt.url = fullUrl;
       apt.id  = fullUrl;
+      // Диагностика: показываем точный исходный текст, из которого
+      // извлечён rooms — нужно один раз увидеть это в логах, чтобы
+      // окончательно понять откуда берётся неправильное значение
+      log.debug(`PARSE_RAW rooms=${apt.rooms} from text="${parentText.replace(/\n/g, ' \\n ').slice(0, 250)}"`);
       result.push(apt);
     } catch (_) {}
   }
