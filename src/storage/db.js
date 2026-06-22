@@ -209,18 +209,36 @@ function deleteApartment(id) {
 
 // Удаляет из таблицы все квартиры, не входящие в переданный список текущих ID.
 // Возвращает удалённые строки (для рассылки "квартира ушла").
+// Также чистит sent_notifications для этих квартир — если объявление
+// потом вернётся на сайт, оно снова будет считаться "новым" и уведомление
+// придёт повторно (без этого wasNotified() заблокировал бы повторную отправку).
 function pruneGoneApartments(currentIds) {
   const known = db.prepare('SELECT * FROM apartments').all();
   const currentSet = new Set(currentIds);
   const gone = known.filter(a => !currentSet.has(a.id));
   const del = db.prepare('DELETE FROM apartments WHERE id = ?');
-  for (const a of gone) del.run(a.id);
+  const delNotif = db.prepare('DELETE FROM sent_notifications WHERE apartment_id = ?');
+  for (const a of gone) {
+    del.run(a.id);
+    delNotif.run(a.id);
+  }
   return gone;
 }
 
 // ================================================================
 //  ОТПРАВЛЕННЫЕ УВЕДОМЛЕНИЯ — защита от дублей при краше посередине рассылки
 // ================================================================
+// Проверяет — отправлялось ли уведомление 'new' хоть кому-то об этой квартире.
+// Используется чтобы отличить "уже была и про неё знают" от "в базе оказалась,
+// но уведомление никогда не уходило" (например, из-за краша между сохранением
+// в базу и рассылкой).
+function wasApartmentEverNotified(apartmentId) {
+  const row = db.prepare(`
+    SELECT 1 FROM sent_notifications WHERE apartment_id = ? AND kind = 'new' LIMIT 1
+  `).get(apartmentId);
+  return !!row;
+}
+
 function wasNotified(chatId, apartmentId, kind) {
   const row = db.prepare(`
     SELECT 1 FROM sent_notifications WHERE user_chat_id=? AND apartment_id=? AND kind=?
@@ -282,7 +300,7 @@ module.exports = {
   getKv, setKv,
   ensureOwner, getUser, upsertUser, getAllSubscribedUsers, getAllUsers, touchUserLastSeen,
   upsertApartment, getApartment, getAllKnownApartmentIds, deleteApartment, pruneGoneApartments,
-  wasNotified, markNotified, pruneOldNotifications,
+  wasNotified, markNotified, pruneOldNotifications, wasApartmentEverNotified,
   cleanupJunkApartments,
   recordStatTick, getLatestStats, getTopDistricts,
 };
