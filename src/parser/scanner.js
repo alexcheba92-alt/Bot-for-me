@@ -115,14 +115,24 @@ async function parseMethodB(page) {
 
       const parentText = await link.evaluate(el => {
         let node = el;
-        for (let i = 0; i < 5; i++) {
+        for (let i = 0; i < 6; i++) {
           node = node.parentElement;
           if (!node) break;
           const t = (node.innerText || '').trim();
-          if ((t.includes('Zimmer') || t.includes('m²')) && t.length > 20) return t;
+          // Раньше проверяли только t.includes('Zimmer') && length > 20 —
+          // этого было недостаточно: блок "Alle Details" с кучей пустых
+          // строк превышал 20 символов по ДЛИНЕ, но не содержал реальных
+          // данных квартиры. Теперь требуем реальное число рядом с Zimmer/€/m².
+          const hasRealData = /\d/.test(t) && (/Zimmer/i.test(t) || /€/.test(t) || /m²/.test(t));
+          if (hasRealData && t.length > 20) return t;
         }
-        return (el.innerText || '').trim();
+        return '';
       }).catch(() => '');
+
+      // Если за 6 уровней родителей не нашли блок с реальными данными — пропускаем.
+      // Раньше тут был fallback на el.innerText() (просто текст самой ссылки),
+      // из-за чего "Alle Details" (текст самой кнопки) проходил дальше.
+      if (!parentText) continue;
 
       if (!parentText.includes('Zimmer') && !parentText.includes('€')) continue;
       if (parentText.includes('OpenStreetMap')) continue;
@@ -131,10 +141,10 @@ async function parseMethodB(page) {
       if (!apt) continue;
       apt.url = fullUrl;
       apt.id  = fullUrl;
-      // Диагностика: показываем точный исходный текст, из которого
-      // извлечён rooms — нужно один раз увидеть это в логах, чтобы
-      // окончательно понять откуда берётся неправильное значение
-      log.debug(`PARSE_RAW rooms=${apt.rooms} from text="${parentText.replace(/\n/g, ' \\n ').slice(0, 250)}"`);
+      // Диагностика: показываем ПОЛНЫЙ исходный текст (без обрезки) —
+      // нужно увидеть где именно встречается Zimmer/€, раз текст начинается
+      // с "Alle Details" и пустых строк, но всё равно проходит фильтр
+      log.debug(`PARSE_RAW len=${parentText.length} rooms=${apt.rooms} text="${parentText.replace(/\n/g, ' | ')}"`);
       result.push(apt);
     } catch (_) {}
   }
