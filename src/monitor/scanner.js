@@ -146,14 +146,25 @@ async function runCheckInternal() {
   //  что подходит именно ему.
   // ═══════════════════════════════════════════════════════════════
   const users = db.getAllSubscribedUsers();
+  log.info(`Подписчиков для рассылки: ${users.length} (${users.map(u => u.chatId).join(', ')})`);
 
   for (const apt of newApts) {
+    log.debug(`Рассылаю квартиру ${apt.id} (rooms=${apt.rooms}, rent=${apt.rent}) для ${users.length} пользователей`);
     for (const user of users) {
-      if (!matchesUser(user, apt)) continue;
-      if (db.wasNotified(user.chatId, apt.id, 'new')) continue; // защита от дублей при краше
+      const matches = matchesUser(user, apt);
+      if (!matches) {
+        log.debug(`  user=${user.chatId} (maxRent=${user.maxRent}, minRooms=${user.minRooms}, district=${user.district}, wbsOk=${user.wbsOk}) — НЕ подходит под фильтр`);
+        continue;
+      }
+      const already = db.wasNotified(user.chatId, apt.id, 'new');
+      if (already) {
+        log.debug(`  user=${user.chatId} — подходит, но уже было отправлено ранее (wasNotified=true)`);
+        continue;
+      }
 
       const { text, markup } = msgNew(apt);
       const sent = await tgText(user.chatId, text, { reply_markup: markup });
+      log.debug(`  user=${user.chatId} — отправка ${sent ? 'УСПЕШНА' : 'ПРОВАЛЕНА'}`);
       if (sent) db.markNotified(user.chatId, apt.id, 'new');
     }
   }
