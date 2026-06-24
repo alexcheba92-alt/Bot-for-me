@@ -110,3 +110,18 @@ test('возвращает null для rooms если число стоит то
     assert.strictEqual(apt.rooms, '', 'rooms не должен извлекаться из "Zimmerausstattung: 1"');
   }
 });
+
+test('парсит формат "Alle Details" (полная карточка с метками полей)', () => {
+  // Реальный текст из прод-лога: метка "Zimmeranzahl:", "Wohnfläche:",
+  // "Kaltmiete:", "Adresse:" — формат отличается от короткой карточки списка
+  const text = 'Alle Details \n  \n  \n              \n              \n                  \n                  \n                                              \n                              \n                                  \n                                                                             Adresse: \n                                          \n                                                                                              \n                                             \t\tMarius-Carpentier-Straße 14, 13587, Spandau                                        \t\t \n  \n  \n  \n                                                                                      \n                                                                             Zimmeranzahl: \n                                          \n                                                                                             3,0                                                                                     \n                                                                             Wohnfläche: \n                                          \n                                                                                             69,00 m²                                                                                     \n                                                                             Kaltmiete: \n                                          \n                                                                                             483,00 €                                                                                     \n                                                                             Nebenkosten: \n                                          \n                                                                                             138,00 €                                                                                     \n                                                                             Gesamtmiete: \n                                          \n                                                                                             621,00 €                                                                                     \n                                                                             WBS: \n                                          \n                                                                                             erforderlich';
+
+  const apt = parseAptText(text);
+  assert.ok(apt, 'должен распарситься');
+  assert.strictEqual(apt.rooms, '3', 'должен извлечь комнаты из "Zimmeranzahl: 3,0"');
+  assert.strictEqual(apt.size, '69', 'должен извлечь площадь из "Wohnfläche: 69,00 m²"');
+  assert.strictEqual(apt.rent, '483.00', 'должен взять Kaltmiete (483), а не Nebenkosten (138) или Gesamtmiete (621)');
+  assert.ok(apt.address.includes('Marius-Carpentier-Straße'), 'должен извлечь адрес из метки "Adresse:"');
+  assert.strictEqual(apt.district, 'Spandau', 'должен извлечь район из адресной строки');
+  assert.ok(apt.wbs, 'должен распознать WBS-квартиру');
+});
