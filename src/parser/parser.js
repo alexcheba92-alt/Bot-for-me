@@ -47,27 +47,69 @@ function parseAptText(text) {
   // (например "Zimmerausstattung: 1 Bad", "Zimmertür 1.20m" и т.п.),
   // что давало ложное rooms=1 для всех квартир. Именно этот паттерн был
   // реальной причиной бага, не "Zi." как предполагалось ранее.
+  // Сайт показывает квартиру в двух разных форматах:
+  // 1) Короткая карточка списка: "3,0 Zimmer, 70 m², 466 €" — число ПЕРЕД словом
+  // 2) Блок "Alle Details": "Zimmeranzahl: ... 3,0 ... Wohnfläche: ..." —
+  //    точная метка "Zimmeranzahl:", число идёт ПОСЛЕ, через пробелы/табы.
+  //    Для формата 2 ограничиваем дистанцию до 80 символов, чтобы случайно
+  //    не захватить число из следующего поля (Wohnfläche/Kaltmiete и т.д.)
   const roomsMatch =
     text.match(/(\d+(?:[.,]\d+)?)\s*(?:1\/2-)?Zimmer\b/i) ||
-    text.match(/(\d+(?:[.,]\d+)?)-Zimmer\b/i);
-  const rooms = roomsMatch ? toFloat(roomsMatch[1]) : null;
+    text.match(/(\d+(?:[.,]\d+)?)-Zimmer\b/i) ||
+    text.match(/Zimmeranzahl:((?:(?!Wohnfläche:|Kaltmiete:)[\s\S]){0,1500}?)(\d+(?:[.,]\d+)?)/i);
+  const rooms = roomsMatch ? toFloat(roomsMatch[roomsMatch.length - 1]) : null;
 
-  const sizeMatch = text.match(/(\d+(?:[,.]?\d+)?)\s*m²/i);
-  const size = sizeMatch ? toFloat(sizeMatch[1]) : null;
+  // Площадь: в формате "Alle Details" явно ищем метку "Wohnfläche:",
+  // чтобы не зависеть от порядка полей на странице. Если метки нет
+  // (короткая карточка списка) — берём первое число перед "m²".
+  // Дистанция до 1500 символов — между меткой и значением на сайте
+  // может быть до ~1000+ символов пробелов/табов/переносов строк.
+  const sizeMatch =
+    text.match(/Wohnfläche:((?:(?!Kaltmiete:|Nebenkosten:)[\s\S]){0,1500}?)(\d+(?:[,.]?\d+)?)\s*m²/i) ||
+    text.match(/(\d+(?:[,.]?\d+)?)\s*m²/i);
+  const size = sizeMatch ? toFloat(sizeMatch[sizeMatch.length - 1]) : null;
 
-  const rentMatch = text.match(/\b(\d{3,4}(?:[,.]\d{1,2})?)\s*€/);
-  const rent = rentMatch ? toFloat(rentMatch[1]) : null;
+  // Аренда: явно ищем метку "Kaltmiete:" — в "Alle Details" рядом есть
+  // ещё Nebenkosten и Gesamtmiete с похожими суммами в €. Без явной метки
+  // легко перепутать поля. Если метки нет — берём первое число перед "€"
+  // (короткая карточка списка, там только одна сумма).
+  const rentMatch =
+    text.match(/Kaltmiete:((?:(?!Nebenkosten:|Gesamtmiete:)[\s\S]){0,1500}?)(\d{2,4}(?:[,.]\d{1,2})?)\s*€/i) ||
+    text.match(/\b(\d{3,4}(?:[,.]\d{1,2})?)\s*€/);
+  const rent = rentMatch ? toFloat(rentMatch[rentMatch.length - 1]) : null;
 
   let address = '';
   let district = '';
-  const pipeIdx = text.indexOf('|');
-  if (pipeIdx !== -1) {
-    const raw = text.slice(pipeIdx + 1).trim().split('\n')[0].trim();
-    address = raw;
-    const plzMatch = raw.match(/\d{5}\s+(.+)/);
-    if (plzMatch) district = plzMatch[1].trim();
-  } else {
+
+  // Формат "Alle Details": есть метка "Adresse:", после неё (через пробелы/
+  // переносы строк/табы) идёт сама строка адреса вида "Straße 14, 13587, Spandau"
+  const addrLabelMatch = text.match(/Adresse:\s*([\s\S]{0,150}?)(?:\n\s*\n|\t\t)/i);
+  if (addrLabelMatch) {
+    const raw = addrLabelMatch[1].replace(/\s+/g, ' ').trim();
+    if (raw) {
+      address = raw;
+      const plzMatch = raw.match(/(\d{5}),?\s*(.+)/);
+      if (plzMatch) district = plzMatch[2].trim();
+    }
+  }
+
+  // Формат короткой карточки списка: "... | Straße 32, 12559 Bezirk"
+  if (!address) {
+    const pipeIdx = text.indexOf('|');
+    if (pipeIdx !== -1) {
+      const raw = text.slice(pipeIdx + 1).trim().split('\n')[0].trim();
+      address = raw;
+      const plzMatch = raw.match(/\d{5}\s+(.+)/);
+      if (plzMatch) district = plzMatch[1].trim();
+    }
+  }
+
+  // Если ничего не сработало — пробуем общие эвристики по тексту целиком
+  if (!address) {
     address  = extractAddress(text);
+    district = extractDistrict(text);
+  }
+  if (!district) {
     district = extractDistrict(text);
   }
 
