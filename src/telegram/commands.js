@@ -28,6 +28,7 @@ function helpText(u) {
     '/pause — приостановить уведомления',
     '/resume — снова получать уведомления',
     '/status — сколько квартир сейчас подходит под твой фильтр',
+    '/debugme — диагностика: подписка и история уведомлений',
     '/help — это сообщение',
     '',
     fmtUserFilters(u),
@@ -86,6 +87,24 @@ async function handleCommand(text, chatId, fromName) {
     await tgText(chatId,
       `📊 Всего квартир на сайте сейчас: <b>${count}</b>\n` +
       `🎯 Подходят под твой фильтр: <b>${matching}</b>`
+    );
+    return;
+  }
+
+  if (text === '/debugme') {
+    const recentNotifs = db.db.prepare(`
+      SELECT apartment_id, kind, sent_at FROM sent_notifications
+      WHERE user_chat_id = ? ORDER BY sent_at DESC LIMIT 5
+    `).all(String(chatId));
+    const notifLines = recentNotifs.length
+      ? recentNotifs.map(n => `${new Date(n.sent_at).toLocaleString('ru-RU')} — ${n.kind} — ${n.apartment_id.slice(0, 50)}`).join('\n')
+      : 'нет отправленных уведомлений';
+    await tgText(chatId,
+      `🔍 <b>Диагностика для chat_id=${chatId}</b>\n\n` +
+      `Зарегистрирован: ${u ? 'да' : 'нет'}\n` +
+      `Подписан (subscribed): ${u.subscribed ? 'да' : 'нет'}\n` +
+      `${fmtUserFilters(u)}\n\n` +
+      `<b>Последние 5 уведомлений:</b>\n${notifLines}`
     );
     return;
   }
