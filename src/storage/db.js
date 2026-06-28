@@ -16,16 +16,17 @@ db.pragma('journal_mode = WAL'); // безопаснее при параллел
 // ================================================================
 db.exec(`
   CREATE TABLE IF NOT EXISTS apartments (
-    id          TEXT PRIMARY KEY,   -- URL объявления
-    address     TEXT,
-    district    TEXT,
-    rooms       REAL,
-    rent        REAL,
-    size        REAL,
-    company     TEXT,
-    wbs         TEXT,
-    first_seen  INTEGER,
-    last_seen   INTEGER
+    id              TEXT PRIMARY KEY,   -- URL объявления
+    address         TEXT,
+    district        TEXT,
+    rooms           REAL,
+    rent            REAL,
+    size            REAL,
+    company         TEXT,
+    wbs             TEXT,
+    first_seen      INTEGER,
+    last_seen       INTEGER,
+    missing_streak  INTEGER DEFAULT 0  -- сколько проверок ПОДРЯД квартира не найдена
   );
 
   CREATE TABLE IF NOT EXISTS users (
@@ -63,6 +64,16 @@ db.exec(`
     avg_duration_ms  INTEGER
   );
 `);
+
+// Миграция для баз, созданных до появления missing_streak — добавляем
+// столбец если его ещё нет (CREATE TABLE IF NOT EXISTS не добавляет
+// новые столбцы в уже существующую таблицу)
+try {
+  db.exec('ALTER TABLE apartments ADD COLUMN missing_streak INTEGER DEFAULT 0');
+  log.info('Миграция: добавлен столбец missing_streak в таблицу apartments');
+} catch (e) {
+  // Столбец уже существует — это ожидаемо при повторных запусках, не ошибка
+}
 
 // ================================================================
 //  KV-НАСТРОЙКИ (замена мелких полей старого state.json)
@@ -207,22 +218,44 @@ function deleteApartment(id) {
   db.prepare('DELETE FROM apartments WHERE id = ?').run(id);
 }
 
-// Удаляет из таблицы все квартиры, не входящие в переданный список текущих ID.
-// Возвращает удалённые строки (для рассылки "квартира ушла").
-// Также чистит sent_notifications для этих квартир — если объявление
-// потом вернётся на сайт, оно снова будет считаться "новым" и уведомление
-// придёт повторно (без этого wasNotified() заблокировал бы повторную отправку).
+// Возвращает квартиры, которые ДЕЙСТВИТЕЛЬНО ушли — то есть не были найдены
+// ДВА раза подряд. Это защита от ложных "ушла"/"новая" пар, которые
+// возникали при временных сбоях парсинга/пагинации (например, гонка
+// между кликом на пагинацию и отрисовкой Livewire-контента): на одном
+// прогоне квартира со страницы 2 могла не попасть в результат, хотя на
+// сайте она всё ещё есть — без grace period это считалось бы "ушла",
+// а через 5 минут — снова "новая", хотя ничего не менялось.
 function pruneGoneApartments(currentIds) {
   const known = db.prepare('SELECT * FROM apartments').all();
   const currentSet = new Set(currentIds);
-  const gone = known.filter(a => !currentSet.has(a.id));
+  const missingNow = known.filter(a => !currentSet.has(a.id));
+
+  const trulyGone = [];
+  const bumpStreak = db.prepare('UPDATE apartments SET missing_streak = missing_streak + 1 WHERE id = ?');
   const del = db.prepare('DELETE FROM apartments WHERE id = ?');
   const delNotif = db.prepare('DELETE FROM sent_notifications WHERE apartment_id = ?');
-  for (const a of gone) {
-    del.run(a.id);
-    delNotif.run(a.id);
+  const resetStreak = db.prepare('UPDATE apartments SET missing_streak = 0 WHERE id = ?');
+
+  for (const a of missingNow) {
+    const newStreak = (a.missing_streak || 0) + 1;
+    if (newStreak >= 2) {
+      // Пропустила 2 проверки подряд — считаем реально ушедшей
+      del.run(a.id);
+      delNotif.run(a.id);
+      trulyGone.push(a);
+    } else {
+      // Первый раз не найдена — даём шанс, возможно временный сбой парсинга
+      bumpStreak.run(a.id);
+      log.debug(`Квартира временно не найдена (streak=${newStreak}), пока не считаю ушедшей: ${a.id}`);
+    }
   }
-  return gone;
+
+  // Квартиры, которые снова нашлись — сбрасываем счётчик пропусков
+  for (const id of currentIds) {
+    resetStreak.run(id);
+  }
+
+  return trulyGone;
 }
 
 // ================================================================
