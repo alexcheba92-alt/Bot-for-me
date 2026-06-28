@@ -206,7 +206,16 @@ async function runCheck() {
     errCount++;
     checksFailed++;
     log.error('ОШИБКА:', e.message);
-    await tgText(C.tgChatId, `⚠️ Ошибка #${errCount}:\n<code>${e.message}</code>`).catch(() => {});
+
+    // Уведомляем владельца только если сбой повторился — единичный таймаут
+    // или краш браузера штатно перехватывается защитой (resetSession +
+    // повтор через 5 минут) и обычно сам восстанавливается. Шум от каждого
+    // разового сетевого сбоя ни о чём не говорит и только тревожит зря.
+    if (errCount >= 2) {
+      await tgText(C.tgChatId, `⚠️ Ошибка #${errCount} (повторяется):\n<code>${e.message}</code>`).catch(() => {});
+    } else {
+      log.warn(`Первый сбой подряд — пробую восстановиться молча: ${e.message}`);
+    }
 
     await resetSession();
     if (errCount % 3 === 0) await closeBrowser();
