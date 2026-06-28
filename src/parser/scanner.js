@@ -206,15 +206,30 @@ async function scrapeAll(page) {
   while (true) {
     log.info(`Страница ${pageNum}...`);
 
-    const items = await parseCurrentPage(page);
+    let items = await parseCurrentPage(page);
 
     const currentUrl = page.url();
-    const urlsOnPage = items.map(a => a.url).filter(Boolean).sort().join('|');
-    const sigShort = currentUrl + '::' + urlsOnPage;
+    let urlsOnPage = items.map(a => a.url).filter(Boolean).sort().join('|');
+    let sigShort = currentUrl + '::' + urlsOnPage;
 
     if (lastPageSignature !== null && sigShort === lastPageSignature) {
-      log.warn('Страница идентична предыдущей — останавливаюсь.');
-      break;
+      // КРИТИЧНО: раньше тут было тихое break — это теряло реальные квартиры
+      // со страницы 2+, если Livewire не успел дорисовать новый контент к
+      // моменту парсинга (гонка между кликом пагинации и парсингом).
+      // Те квартиры потом ложно регистрировались как "ушли", а через 5 минут
+      // снова как "новые" — хотя на сайте ничего не менялось.
+      // Теперь даём странице один доп. шанс: ждём и парсим повторно.
+      log.warn('Страница идентична предыдущей — возможно контент не успел обновиться. Жду и пробую ещё раз...');
+      await page.waitForTimeout(2500);
+      items = await parseCurrentPage(page);
+      urlsOnPage = items.map(a => a.url).filter(Boolean).sort().join('|');
+      sigShort = page.url() + '::' + urlsOnPage;
+
+      if (sigShort === lastPageSignature) {
+        log.warn('После повторной попытки страница всё ещё идентична — пагинация реально не продвинулась, останавливаюсь.');
+        break;
+      }
+      log.info('После повторной попытки контент обновился, продолжаю как обычно.');
     }
 
     let newOnPage = 0;
