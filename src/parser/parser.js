@@ -139,10 +139,21 @@ function isJunkUrl(url) {
 
   const junkPaths = ['/support', '/account', '/profil', '/sicherheit', '/datenschutz',
                      '/impressum', '/kontakt', '/startseite', '/tauschportal',
-                     '/login', '/logout', '/agb'];
+                     '/login', '/logout', '/agb', '/nutzungsbedingungen',
+                     '/barrierefreiheit', '/cookie', '/presse', '/karriere'];
   for (const j of junkPaths) {
     if (url.includes(j)) return true;
   }
+
+  // Дополнительная защита: домен самого inberlinwohnen.de почти никогда не
+  // является реальной квартирой (объявления хостятся на сайтах компаний —
+  // degewo.de, howoge.de, gewobag.de и т.д.). Любая ссылка на сам
+  // inberlinwohnen.de, кроме уже обработанных выше случаев, — почти всегда
+  // навигация/меню/футер, а не объявление.
+  if (url.includes('inberlinwohnen.de') && !/\/detail\/|\/wohnungssuche\//i.test(url)) {
+    return true;
+  }
+
   return false;
 }
 
