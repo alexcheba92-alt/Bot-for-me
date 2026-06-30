@@ -3,7 +3,7 @@
 const { checkConfig } = require('./config/config');
 const log = require('./utils/logger');
 const db  = require('./storage/db');
-const { acquireLock, releaseLock } = require('./storage/lock');
+const { acquireLock, releaseLock, startLockHeartbeat } = require('./storage/lock');
 const { checkLoop } = require('./monitor/scanner');
 const { startPolling } = require('./telegram/polling');
 const { closeBrowser } = require('./browser/browser');
@@ -13,6 +13,7 @@ const { C } = require('./config/config');
 async function main() {
   checkConfig();
   acquireLock();
+  startLockHeartbeat();
   db.ensureOwner();
   db.cleanupJunkApartments(); // чистим мусор, накопленный до исправления валидации
 
