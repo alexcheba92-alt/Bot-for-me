@@ -328,13 +328,31 @@ function resetApartmentsTable() {
 }
 
 function cleanupJunkApartments() {
-  const result = db.prepare(`
+  const result1 = db.prepare(`
     DELETE FROM apartments WHERE id IS NULL OR id = '' OR (address IS NULL AND district IS NULL)
   `).run();
-  if (result.changes > 0) {
-    log.info(`Очищено ${result.changes} битых записей квартир из базы`);
+
+  // Дополнительно: убираем записи с заведомо мусорными URL (навигация,
+  // юридические страницы и т.п.), которые могли попасть в базу до того,
+  // как isJunkUrl() в parser.js начал их фильтровать на входе
+  const { isJunkUrl } = require('../parser/parser');
+  const all = db.prepare('SELECT id FROM apartments').all();
+  let removedByUrl = 0;
+  const del = db.prepare('DELETE FROM apartments WHERE id = ?');
+  const delNotif = db.prepare('DELETE FROM sent_notifications WHERE apartment_id = ?');
+  for (const row of all) {
+    if (isJunkUrl(row.id)) {
+      del.run(row.id);
+      delNotif.run(row.id);
+      removedByUrl++;
+    }
   }
-  return result.changes;
+
+  const total = result1.changes + removedByUrl;
+  if (total > 0) {
+    log.info(`Очищено ${total} битых/мусорных записей квартир из базы (${result1.changes} без адреса, ${removedByUrl} по мусорному URL)`);
+  }
+  return total;
 }
 
 module.exports = {
